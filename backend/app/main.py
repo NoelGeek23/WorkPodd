@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.agent.graph import build_langgraph_definition, run_refund_agent
+from app.agent.prescreen_graph import build_prescreen_langgraph_definition
 from app.agent.interactive import handle_interactive_chat, handle_interactive_upload
 from app.agent.session_memory import clear_session_memory, get_session_memory
 from app.agent.tools import find_customer, load_policy
@@ -60,6 +61,7 @@ ensure_fraud_index()
 ensure_refund_policy_index()
 
 _compiled_langgraph = build_langgraph_definition()
+_compiled_prescreen_langgraph = build_prescreen_langgraph_definition()
 DEMO_PASSWORD = "12345678"
 ADMIN_EMAIL = "admin@mailinator.com"
 SESSIONS: dict[str, dict[str, str]] = {}
@@ -305,6 +307,7 @@ async def health() -> dict:
     return {
         "status": "ok",
         "langgraph_available": _compiled_langgraph is not None,
+        "prescreen_langgraph_available": _compiled_prescreen_langgraph is not None,
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
         "database_ready": has_seed_data(),
     }

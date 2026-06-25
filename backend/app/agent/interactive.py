@@ -12,6 +12,7 @@ from app.agent.conversational import (
     unable_to_answer_response,
 )
 from app.agent.graph import run_refund_agent
+from app.agent.prescreen_graph import run_return_prescreen_agent
 from app.agent.session_memory import AssistantSessionMemory
 from app.agent.tools import (
     CANCELLABLE_TICKET_STATUSES,
@@ -29,6 +30,7 @@ from app.models import (
     InteractiveChatRequest,
     InteractiveChatResponse,
     InteractiveUploadRequest,
+    RefundDecision,
     ToolCallLog,
 )
 from app.rag.policy_index import (
@@ -263,7 +265,7 @@ async def handle_interactive_chat(
             order_id=request.selected_option,
             metadata={"selected_option": request.selected_option},
         )
-        return _handle_purchase_selection(customer, memory, request.selected_option)
+        return await _handle_purchase_selection(customer, memory, request.selected_option)
 
     if request.action_id == "return_details":
         _log_reasoning(
@@ -311,7 +313,7 @@ async def handle_interactive_chat(
             customer_id=customer.id,
             metadata={"intent": memory.current_intent},
         )
-        return _start_return_exchange(customer, memory, message)
+        return await _start_return_exchange(customer, memory, message)
 
     intent = _classify_intent(message)
     memory.current_intent = intent
@@ -329,7 +331,7 @@ async def handle_interactive_chat(
         return _answer_purchase_query(customer, memory, message)
 
     if intent == "return_exchange_request":
-        return _start_return_exchange(customer, memory, message)
+        return await _start_return_exchange(customer, memory, message)
 
     if intent == "ticket_request":
         return await _handle_ticket_request(customer, memory, message)
@@ -1056,7 +1058,87 @@ def _contact_support_response(
     )
 
 
-def _start_return_exchange(
+async def _continue_after_order_selected(
+    customer: CustomerProfile,
+    memory: AssistantSessionMemory,
+    order,
+    *,
+    intro: str | None = None,
+) -> InteractiveChatResponse:
+    product_names = ", ".join(item.name for item in order.items)
+    prescreen = await run_return_prescreen_agent(customer_id=customer.id, order_id=order.id)
+
+    if prescreen.outcome == "REJECT":
+        memory.workflow_state = "idle"
+        memory.selected_order_id = None
+        memory.selected_product_name = None
+        memory.selected_reason = None
+        memory.evidence_retry_count = 0
+        _log_reasoning(
+            "prescreen_rejected",
+            "Pre-return eligibility agent rejected the order before reason collection.",
+            customer_id=customer.id,
+            order_id=order.id,
+            metadata={
+                "internal_reason": prescreen.internal_reason,
+                "tool_calls": [call.model_dump(mode="json") for call in prescreen.tool_calls],
+            },
+        )
+        content = (
+            f"{_hi(customer)}, {product_names} on order {order.id} is not eligible for a return. "
+            f"{prescreen.customer_message}"
+        )
+        memory.remember("assistant", content)
+        decision = public_refund_decision(
+            RefundDecision(
+                status="denied",
+                customer_message=prescreen.customer_message,
+                internal_reason=prescreen.internal_reason,
+                amount=0,
+                order_id=order.id,
+                policy_rules=prescreen.policy_rules,
+                tool_calls=prescreen.tool_calls,
+            )
+        )
+        return InteractiveChatResponse(
+            messages=memory.messages,
+            actions=[],
+            citations=[],
+            decision=decision,
+            memory=memory.public_state(),
+        )
+
+    memory.selected_order_id = order.id
+    memory.selected_product_name = product_names
+    memory.evidence_retry_count = 0
+    memory.workflow_state = "awaiting_return_reason"
+    _log_reasoning(
+        "prescreen_passed",
+        "Pre-return eligibility agent cleared the order for reason collection.",
+        customer_id=customer.id,
+        order_id=order.id,
+        metadata={"product_names": product_names},
+    )
+    content = intro or (
+        f"Got it, {_first_name(customer)}. What is the reason for returning {product_names} "
+        f"from order {order.id}?"
+    )
+    memory.remember("assistant", content)
+    return InteractiveChatResponse(
+        messages=memory.messages,
+        actions=[
+            AssistantAction(
+                id="return_reason",
+                type="show_reason_options",
+                label="Select a reason",
+                options=RETURN_REASONS,
+            )
+        ],
+        memory=memory.public_state(),
+    )
+
+
+async def _start_return_exchange(
     customer: CustomerProfile,
     memory: AssistantSessionMemory,
     message: str,
@@ -1093,33 +1175,14 @@ def _start_return_exchange(
             f"on order {order.id}: {active_ticket['request_id']}. You can update it from Active Tickets.",
         )
 
-    memory.selected_order_id = order.id
-    memory.selected_product_name = ", ".join(item.name for item in order.items)
-    memory.evidence_retry_count = 0
-    memory.workflow_state = "awaiting_return_reason"
-    _log_reasoning(
-        "purchase_resolution",
-        "Resolved return request to a customer order.",
-        customer_id=customer.id,
-        order_id=order.id,
-        metadata={"product_names": memory.selected_product_name},
-    )
-    content = (
-        f"{_hi(customer)}, I found {memory.selected_product_name} on order {order.id}. "
-        "What is the reason for your return or exchange request?"
-    )
-    memory.remember("assistant", content)
-    return InteractiveChatResponse(
-        messages=memory.messages,
-        actions=[
-            AssistantAction(
-                id="return_reason",
-                type="show_reason_options",
-                label="Select a reason",
-                options=RETURN_REASONS,
-            )
-        ],
-        memory=memory.public_state(),
+    return await _continue_after_order_selected(
+        customer,
+        memory,
+        order,
+        intro=(
+            f"{_hi(customer)}, I found {', '.join(item.name for item in order.items)} on order {order.id}. "
+            "What is the reason for your return or exchange request?"
+        ),
     )
 
 
@@ -1178,7 +1241,7 @@ def _purchase_option(order) -> AssistantOption:
     return AssistantOption(id=order.id, label=product_names, description=description)
 
 
-def _handle_purchase_selection(
+async def _handle_purchase_selection(
     customer: CustomerProfile,
     memory: AssistantSessionMemory,
     selected_order_id: str,
@@ -1217,35 +1280,14 @@ def _handle_purchase_selection(
 
     product_names = ", ".join(item.name for item in order.items)
     memory.remember("user", f"Selected {product_names} on order {order.id}")
-    memory.selected_order_id = order.id
-    memory.selected_product_name = product_names
-    memory.evidence_retry_count = 0
-    memory.workflow_state = "awaiting_return_reason"
     _log_reasoning(
         "purchase_selection",
-        "Accepted purchase selection and requested return reason.",
+        "Customer selected a purchase; running pre-return eligibility agent.",
         customer_id=customer.id,
         order_id=order.id,
         metadata={"product_names": product_names},
     )
-
-    content = (
-        f"Got it, {_first_name(customer)}. What is the reason for returning {product_names} "
-        f"from order {order.id}?"
-    )
-    memory.remember("assistant", content)
-    return InteractiveChatResponse(
-        messages=memory.messages,
-        actions=[
-            AssistantAction(
-                id="return_reason",
-                type="show_reason_options",
-                label="Select a reason",
-                options=RETURN_REASONS,
-            )
-        ],
-        memory=memory.public_state(),
-    )
+    return await _continue_after_order_selected(customer, memory, order)
 
 
 async def _handle_reason_selection(
