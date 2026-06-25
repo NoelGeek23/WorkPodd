@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import re
 from difflib import SequenceMatcher
-from datetime import date
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -27,12 +26,17 @@ from app.models import (
     InteractiveUploadRequest,
     LoginRequest,
     LoginResponse,
+    RefundDecision,
     ScopedChatRequest,
     TicketUpdateRequest,
 )
-from app.rag.policy_index import ensure_policy_index, retrieve_policy_sections
+from app.rag.fraud_index import ensure_fraud_index
+from app.rag.policy_index import ensure_policy_index
+from app.rag.refund_policy_index import ensure_refund_policy_index
+from app.services.customer_decisions import public_refund_decision
 from app.services.evidence_store import get_evidence_file, persist_ticket_evidence
 from app.services.log_bus import log_bus
+from app.services.refund_decisions import apply_refund_decision, approval_message
 from app.services.realtime import create_realtime_session
 
 load_dotenv()
@@ -52,6 +56,8 @@ initialize_schema()
 if not has_seed_data():
     seed_demo_data(reset=True)
 ensure_policy_index()
+ensure_fraud_index()
+ensure_refund_policy_index()
 
 _compiled_langgraph = build_langgraph_definition()
 DEMO_PASSWORD = "12345678"
@@ -233,6 +239,65 @@ def _attach_ticket_evidence(connection, tickets: list[dict]) -> None:
             (ticket["request_id"],),
         ).fetchall()
         ticket["evidence"] = rows_to_dicts(evidence_rows)
+
+
+def _attach_fraud_assessments(connection, tickets: list[dict]) -> None:
+    import json
+
+    for ticket in tickets:
+        row = connection.execute(
+            """
+            SELECT fraud_score, risk_level, is_fraud_flagged, signals_json, reasoning, policy_sections_json
+            FROM FraudDetectionRun
+            WHERE request_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (ticket["request_id"],),
+        ).fetchone()
+        if not row:
+            ticket["fraud_flagged"] = False
+            ticket["fraud_score"] = None
+            ticket["fraud_risk_level"] = None
+            ticket["fraud_reasoning"] = None
+            ticket["fraud_signals"] = []
+            ticket["fraud_policy_citations"] = []
+            continue
+        ticket["fraud_flagged"] = bool(row["is_fraud_flagged"])
+        ticket["fraud_score"] = int(row["fraud_score"])
+        ticket["fraud_risk_level"] = row["risk_level"]
+        ticket["fraud_reasoning"] = row["reasoning"]
+        ticket["fraud_signals"] = json.loads(row["signals_json"] or "[]")
+        ticket["fraud_policy_citations"] = json.loads(row["policy_sections_json"] or "[]")
+
+
+def _attach_refund_evaluations(connection, tickets: list[dict]) -> None:
+    import json
+
+    for ticket in tickets:
+        row = connection.execute(
+            """
+            SELECT outcome, reasoning, signals_json, policy_sections_json,
+                   customer_reason, customer_description
+            FROM RefundEvaluationRun
+            WHERE request_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (ticket["request_id"],),
+        ).fetchone()
+        if not row:
+            ticket["refund_evaluated"] = False
+            ticket["refund_outcome"] = None
+            ticket["refund_reasoning"] = None
+            ticket["refund_signals"] = []
+            ticket["refund_policy_citations"] = []
+            continue
+        ticket["refund_evaluated"] = True
+        ticket["refund_outcome"] = row["outcome"]
+        ticket["refund_reasoning"] = row["reasoning"]
+        ticket["refund_signals"] = json.loads(row["signals_json"] or "[]")
+        ticket["refund_policy_citations"] = json.loads(row["policy_sections_json"] or "[]")
 
 
 @app.get("/api/health")
@@ -446,6 +511,8 @@ async def admin_tickets(_admin: dict[str, str] = Depends(get_current_admin)) -> 
         ).fetchall()
         tickets = rows_to_dicts(rows)
         _attach_ticket_evidence(connection, tickets)
+        _attach_fraud_assessments(connection, tickets)
+        _attach_refund_evaluations(connection, tickets)
     return {"tickets": tickets}
 
 
@@ -468,38 +535,22 @@ async def approve_admin_ticket(
         if not ticket:
             raise HTTPException(status_code=404, detail="Ticket not found or already decided")
 
-        refund_amount = float(ticket["total_amount"])
-        approval_message = (
-            f"Refund of ${refund_amount:.2f} will be transferred to your original bank account "
-            "within 5-7 business days."
-        )
-        connection.execute(
-            """
-            UPDATE ReturnRequest
-            SET status = 'Approved', admin_message = ?
-            WHERE request_id = ?
-            """,
-            (approval_message, request_id),
-        )
-        connection.execute(
-            "UPDATE Orders SET status = 'returned' WHERE order_id = ?",
-            (ticket["order_id"],),
-        )
-        connection.execute(
-            """
-            INSERT INTO RefundHistory (
-                refund_id, customer_id, order_id, refund_amount, refund_reason, approved_date
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                f"ref_{uuid4().hex[:8]}",
-                ticket["customer_id"],
-                ticket["order_id"],
-                refund_amount,
-                ticket["reason"],
-                date.today().isoformat(),
-            ),
-        )
+    refund_amount = float(ticket["total_amount"])
+    decision = RefundDecision(
+        status="approved",
+        customer_message=approval_message(refund_amount),
+        internal_reason="Admin approved the return request.",
+        amount=refund_amount,
+        order_id=ticket["order_id"],
+        policy_rules=["Admin manual approval"],
+    )
+    await apply_refund_decision(
+        decision=decision,
+        customer_id=ticket["customer_id"],
+        order_id=ticket["order_id"],
+        request_id=request_id,
+        actor="admin",
+    )
 
     await log_bus.publish(
         "admin_decision",
@@ -534,14 +585,21 @@ async def reject_admin_ticket(
         if not ticket:
             raise HTTPException(status_code=404, detail="Ticket not found or already decided")
 
-        connection.execute(
-            """
-            UPDATE ReturnRequest
-            SET status = 'Denied', admin_message = ?
-            WHERE request_id = ?
-            """,
-            (reason, request_id),
-        )
+    decision = RefundDecision(
+        status="denied",
+        customer_message=reason,
+        internal_reason=reason,
+        amount=0,
+        order_id=ticket["order_id"],
+        policy_rules=["Admin manual rejection"],
+    )
+    await apply_refund_decision(
+        decision=decision,
+        customer_id=ticket["customer_id"],
+        order_id=ticket["order_id"],
+        request_id=request_id,
+        actor="admin",
+    )
 
     await log_bus.publish(
         "admin_decision",
@@ -592,16 +650,28 @@ async def customer(customer_id: str, current_customer: CustomerProfile = Depends
 
 @app.get("/api/policy")
 async def policy() -> dict:
-    return {"policy": load_policy()}
+    from app.rag.policy_index import filter_customer_policy_sections, load_policy, chunk_policy
+
+    visible_chunks = filter_customer_policy_sections(
+        [{"section_title": chunk["section_title"], "content": chunk["content"]} for chunk in chunk_policy(load_policy())]
+    )
+    policy_text = "\n\n".join(
+        f"## {chunk['section_title']}\n{chunk['content']}" for chunk in visible_chunks
+    )
+    return {"policy": policy_text}
 
 
 @app.get("/api/policy/search")
 async def policy_search(q: str) -> dict:
-    return {"query": q, "sections": retrieve_policy_sections(q)}
+    from app.rag.policy_index import retrieve_customer_policy_sections
+
+    return {"query": q, "sections": retrieve_customer_policy_sections(q)}
 
 
 @app.get("/api/policy/sections")
 async def policy_sections() -> dict:
+    from app.rag.policy_index import is_customer_visible_policy_section
+
     with get_connection() as connection:
         rows = connection.execute(
             """
@@ -610,7 +680,12 @@ async def policy_sections() -> dict:
             ORDER BY chunk_id
             """
         ).fetchall()
-    return {"sections": rows_to_dicts(rows)}
+    sections = [
+        row
+        for row in rows_to_dicts(rows)
+        if is_customer_visible_policy_section(str(row.get("section_title", "")))
+    ]
+    return {"sections": sections}
 
 
 @app.get("/api/return-requests")
@@ -659,7 +734,14 @@ async def chat(
     if resolved_order_id and all(order.id != resolved_order_id for order in current_customer.orders):
         raise HTTPException(status_code=403, detail="Order does not belong to logged-in customer")
     decision = await run_refund_agent(request.model_copy(update={"order_id": resolved_order_id}))
-    return ChatResponse(reply=decision.customer_message, decision=decision)
+    await apply_refund_decision(
+        decision=decision,
+        customer_id=current_customer.id,
+        order_id=resolved_order_id,
+        actor="agent",
+    )
+    public = public_refund_decision(decision)
+    return ChatResponse(reply=public.customer_message, decision=public)
 
 
 @app.post("/api/me/chat", response_model=ChatResponse)
@@ -682,7 +764,14 @@ async def scoped_chat(
             message=request.message,
         )
     )
-    return ChatResponse(reply=decision.customer_message, decision=decision)
+    await apply_refund_decision(
+        decision=decision,
+        customer_id=current_customer.id,
+        order_id=resolved_order_id,
+        actor="agent",
+    )
+    public = public_refund_decision(decision)
+    return ChatResponse(reply=public.customer_message, decision=public)
 
 
 @app.post("/api/me/assistant/chat", response_model=InteractiveChatResponse)
@@ -702,14 +791,15 @@ async def assistant_upload(
 ) -> InteractiveChatResponse:
     session_token, current_customer = session
     memory = get_session_memory(session_token)
-    return handle_interactive_upload(current_customer, memory, request)
+    return await handle_interactive_upload(current_customer, memory, request)
 
 
 @app.get("/api/agent/logs")
 async def agent_logs(session: tuple[str, dict[str, str]] = Depends(get_current_session_record)) -> StreamingResponse:
     _session_token, session_record = session
-    customer_id = None if session_record.get("role") == "admin" else session_record["id"]
-    return StreamingResponse(log_bus.stream(customer_id), media_type="text/event-stream")
+    if session_record.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin session required")
+    return StreamingResponse(log_bus.stream(None), media_type="text/event-stream")
 
 
 @app.post("/api/voice/session")

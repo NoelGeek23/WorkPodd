@@ -7,7 +7,9 @@ from uuid import uuid4
 
 from app.db.database import get_connection, int_to_bool, rows_to_dicts
 from app.models import CustomerProfile, Order, OrderItem, RefundDecision, ToolCallLog
-from app.rag.policy_index import load_policy, retrieve_policy_sections as rag_retrieve_policy_sections
+from app.rag.policy_index import load_policy
+from app.rag.refund_policy_index import retrieve_refund_policy_sections as rag_retrieve_refund_policy_sections
+from app.services.product_classification import is_hygiene_sensitive_product
 
 DEMO_TODAY = date(2026, 6, 22)
 
@@ -293,7 +295,7 @@ def retrieve_policy_sections(query: str, order: Order | None = None) -> tuple[li
         for item in (order.items if order else [])
     )
     full_query = f"{query} {order.status if order else ''} {order.tracking_status if order else ''} {item_context}"
-    sections = rag_retrieve_policy_sections(full_query)
+    sections = rag_retrieve_refund_policy_sections(full_query)
     return sections, _call(
         "retrieve_policy_sections",
         {"query": query, "order_id": order.id if order else None},
@@ -367,7 +369,7 @@ def check_item_condition(order: Order) -> ToolCallLog:
             denials.append(f"{label}: digital delivered goods are not refundable.")
         elif item.subscription_product:
             denials.append(f"{label}: subscription products require manual subscription support.")
-        elif item.hygiene_sensitive and item.condition != "unopened":
+        elif is_hygiene_sensitive_product(item) and item.condition != "unopened":
             denials.append(f"{label}: opened hygiene-sensitive items are not refundable.")
         elif not item.original_packaging_present:
             denials.append(f"{label}: original packaging is required for automatic refunds.")
@@ -392,7 +394,9 @@ def check_item_condition(order: Order) -> ToolCallLog:
 
 
 def check_opened_item_loyalty(customer: CustomerProfile, order: Order) -> ToolCallLog:
-    has_opened = any(item.condition == "opened" and not item.hygiene_sensitive for item in order.items)
+    has_opened = any(
+        item.condition == "opened" and not is_hygiene_sensitive_product(item) for item in order.items
+    )
     eligible = not has_opened or customer.loyalty_tier.value in {"gold", "platinum"} or "VIP: yes" in customer.notes
     output = {
         "eligible": eligible,
@@ -512,3 +516,132 @@ def store_agent_decision(
         {"request_id": request_id, "decision": audit_decision or decision.status},
         {"decision_id": decision_id, "policy_sections_used": section_refs},
     )
+
+
+CANCELLABLE_TICKET_STATUSES = ("Pending", "Manual Review", "Manager Review")
+
+
+def list_customer_tickets(
+    customer_id: str,
+    *,
+    active_only: bool = True,
+    limit: int = 10,
+) -> tuple[list[dict], ToolCallLog]:
+    status_clause = "AND rr.status NOT IN ('Closed')" if active_only else ""
+    with get_connection() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT
+                rr.request_id,
+                rr.order_id,
+                rr.request_date,
+                rr.reason,
+                rr.status,
+                rr.requested_resolution,
+                GROUP_CONCAT(p.name, ', ') AS product_names
+            FROM ReturnRequest rr
+            LEFT JOIN OrderItem oi ON oi.order_id = rr.order_id
+            LEFT JOIN Product p ON p.product_id = oi.product_id
+            WHERE rr.customer_id = ?
+              {status_clause}
+            GROUP BY rr.request_id
+            ORDER BY rr.request_date DESC, rr.request_id DESC
+            LIMIT ?
+            """,
+            (customer_id, limit),
+        ).fetchall()
+    tickets = rows_to_dicts(rows)
+    return tickets, _call(
+        "list_customer_tickets",
+        {"customer_id": customer_id, "active_only": active_only, "limit": limit},
+        {"count": len(tickets), "tickets": tickets},
+    )
+
+
+def get_customer_ticket(customer_id: str, request_id: str) -> tuple[dict | None, ToolCallLog]:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT
+                rr.request_id,
+                rr.order_id,
+                rr.request_date,
+                rr.reason,
+                rr.status,
+                rr.requested_resolution,
+                GROUP_CONCAT(p.name, ', ') AS product_names
+            FROM ReturnRequest rr
+            LEFT JOIN OrderItem oi ON oi.order_id = rr.order_id
+            LEFT JOIN Product p ON p.product_id = oi.product_id
+            WHERE rr.customer_id = ?
+              AND rr.request_id = ?
+            GROUP BY rr.request_id
+            """,
+            (customer_id, request_id),
+        ).fetchone()
+    ticket = dict(row) if row else None
+    output: dict[str, Any] = ticket if ticket else {"found": False}
+    if ticket:
+        output["found"] = True
+    return ticket, _call(
+        "get_customer_ticket",
+        {"customer_id": customer_id, "request_id": request_id},
+        output,
+    )
+
+
+def cancel_customer_ticket(customer_id: str, request_id: str) -> tuple[dict, ToolCallLog]:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT request_id, order_id, status, reason, request_date
+            FROM ReturnRequest
+            WHERE request_id = ?
+              AND customer_id = ?
+            """,
+            (request_id, customer_id),
+        ).fetchone()
+        if not row:
+            output = {"cancelled": False, "reason": "not_found", "request_id": request_id}
+            return output, _call(
+                "cancel_customer_ticket",
+                {"customer_id": customer_id, "request_id": request_id},
+                output,
+            )
+
+        status = str(row["status"])
+        if status not in CANCELLABLE_TICKET_STATUSES:
+            output = {
+                "cancelled": False,
+                "reason": "not_cancellable",
+                "request_id": request_id,
+                "order_id": row["order_id"],
+                "status": status,
+            }
+            return output, _call(
+                "cancel_customer_ticket",
+                {"customer_id": customer_id, "request_id": request_id},
+                output,
+            )
+
+        connection.execute(
+            """
+            UPDATE ReturnRequest
+            SET status = 'Closed'
+            WHERE request_id = ?
+              AND customer_id = ?
+            """,
+            (request_id, customer_id),
+        )
+        output = {
+            "cancelled": True,
+            "request_id": request_id,
+            "order_id": row["order_id"],
+            "previous_status": status,
+            "reason": row["reason"],
+        }
+        return output, _call(
+            "cancel_customer_ticket",
+            {"customer_id": customer_id, "request_id": request_id},
+            output,
+        )

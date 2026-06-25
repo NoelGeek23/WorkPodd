@@ -152,6 +152,50 @@ CREATE TABLE IF NOT EXISTS PolicyIndexMetadata (
     updated_at DATETIME
 );
 
+CREATE TABLE IF NOT EXISTS FraudDetectionRun (
+    run_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    order_id TEXT NOT NULL,
+    fraud_score INTEGER NOT NULL,
+    risk_level TEXT NOT NULL,
+    is_fraud_flagged BOOLEAN NOT NULL DEFAULT 0,
+    signals_json TEXT NOT NULL,
+    reasoning TEXT NOT NULL,
+    policy_sections_json TEXT NOT NULL,
+    created_at DATETIME NOT NULL,
+    FOREIGN KEY(request_id)
+        REFERENCES ReturnRequest(request_id),
+    FOREIGN KEY(customer_id)
+        REFERENCES Customer(customer_id),
+    FOREIGN KEY(order_id)
+        REFERENCES Orders(order_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fraud_detection_request_id ON FraudDetectionRun(request_id);
+
+CREATE TABLE IF NOT EXISTS RefundEvaluationRun (
+    run_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    order_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    reasoning TEXT NOT NULL,
+    policy_sections_json TEXT NOT NULL,
+    signals_json TEXT NOT NULL,
+    customer_reason TEXT NOT NULL,
+    customer_description TEXT NOT NULL,
+    created_at DATETIME NOT NULL,
+    FOREIGN KEY(request_id)
+        REFERENCES ReturnRequest(request_id),
+    FOREIGN KEY(customer_id)
+        REFERENCES Customer(customer_id),
+    FOREIGN KEY(order_id)
+        REFERENCES Orders(order_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_refund_evaluation_request_id ON RefundEvaluationRun(request_id);
+
 CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON Orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_order_item_order_id ON OrderItem(order_id);
 CREATE INDEX IF NOT EXISTS idx_return_request_customer_id ON ReturnRequest(customer_id);

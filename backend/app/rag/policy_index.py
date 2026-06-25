@@ -112,6 +112,32 @@ def ensure_policy_index() -> None:
         rebuild_policy_index()
 
 
+INTERNAL_POLICY_SECTION_TITLES = frozenset(
+    {
+        "Fraud Prevention Rules",
+        "Refund Abuse Policy",
+        "Escalation Matrix",
+        "Decision Priority Rules",
+    }
+)
+
+
+def is_customer_visible_policy_section(section_title: str) -> bool:
+    return section_title not in INTERNAL_POLICY_SECTION_TITLES
+
+
+def filter_customer_policy_sections(sections: list[dict]) -> list[dict]:
+    return [
+        section
+        for section in sections
+        if is_customer_visible_policy_section(str(section.get("section_title", "")))
+    ]
+
+
+def retrieve_customer_policy_sections(query: str, limit: int = 4) -> list[dict]:
+    return filter_customer_policy_sections(retrieve_policy_sections(query, limit=limit))
+
+
 def retrieve_policy_sections(query: str, limit: int = 4) -> list[dict]:
     ensure_policy_index()
     query_vector = _embedding(query)

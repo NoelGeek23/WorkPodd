@@ -1,14 +1,17 @@
 import { useRef, useState } from "react";
-import { API_BASE_URL, createRealtimeSession, sendChat } from "../lib/api";
+import { API_BASE_URL, RefundDecision, createRealtimeSession, sendChat } from "../lib/api";
+import RefundDecisionCard from "./RefundDecisionCard";
 
 type Props = {
   token: string;
+  onDecision?: () => void;
 };
 
-export default function VoicePanel({ token }: Props) {
+export default function VoicePanel({ token, onDecision }: Props) {
   const [status, setStatus] = useState("Idle");
   const [transcript, setTranscript] = useState("");
   const [reply, setReply] = useState("");
+  const [decision, setDecision] = useState<RefundDecision | null>(null);
   const [error, setError] = useState("");
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -16,6 +19,7 @@ export default function VoicePanel({ token }: Props) {
   async function startVoice() {
     setError("");
     setReply("");
+    setDecision(null);
     setStatus("Creating Realtime session...");
 
     try {
@@ -91,11 +95,15 @@ export default function VoicePanel({ token }: Props) {
 
     setError("");
     setReply("Checking refund policy...");
+    setDecision(null);
     try {
       const response = await sendChat(token, transcript);
-      setReply(`${response.decision.status.toUpperCase()}: ${response.reply}`);
+      setReply(response.decision ? "" : response.reply);
+      setDecision(response.decision);
+      onDecision?.();
     } catch (err) {
       setReply("");
+      setDecision(null);
       setError(err instanceof Error ? err.message : "Transcript submission failed");
     }
   }
@@ -139,7 +147,11 @@ export default function VoicePanel({ token }: Props) {
         Submit transcript to refund agent
       </button>
 
-      {reply ? <div className="success-banner">{reply}</div> : null}
+      {decision ? (
+        <RefundDecisionCard decision={decision} />
+      ) : reply ? (
+        <div className="success-banner">{reply}</div>
+      ) : null}
       {error ? <div className="error-banner">{error}</div> : null}
     </section>
   );

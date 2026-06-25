@@ -3,6 +3,7 @@ import ContactSupportOptions from "./ContactSupportOptions";
 import ImageUploadPrompt from "./ImageUploadPrompt";
 import PurchaseSelector from "./PurchaseSelector";
 import ReasonOptions from "./ReasonOptions";
+import RefundDecisionCard from "./RefundDecisionCard";
 import ReturnDetailsPrompt from "./ReturnDetailsPrompt";
 import {
   AssistantAction,
@@ -15,9 +16,15 @@ import {
   uploadAssistantImage,
 } from "../lib/api";
 import { readFileAsBase64 } from "../lib/evidence";
+import {
+  chatEmptyStateHint,
+  chatGreeting,
+  chatInputPlaceholder,
+} from "../lib/customerPersonalization";
 
 type Props = {
   token: string;
+  customerName: string;
   messages: AssistantMessage[];
   actions: AssistantAction[];
   decision: RefundDecision | null;
@@ -27,6 +34,7 @@ type Props = {
     decision: RefundDecision | null;
   }) => void;
   onSessionRestore?: () => Promise<void>;
+  onDecision?: () => void;
 };
 
 const samplePrompt = "What is the return window for VIP customers?";
@@ -50,13 +58,15 @@ type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
 
 export default function ChatPanel({
   token,
+  customerName,
   messages,
   actions,
   decision,
   onStateChange,
   onSessionRestore,
+  onDecision,
 }: Props) {
-  const [message, setMessage] = useState(samplePrompt);
+  const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [listening, setListening] = useState(false);
@@ -77,6 +87,9 @@ export default function ChatPanel({
       actions: response.actions,
       decision: response.decision,
     });
+    if (response.decision) {
+      onDecision?.();
+    }
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -170,7 +183,7 @@ export default function ChatPanel({
       await restartAssistantChat(token);
       onStateChange({ messages: [], actions: [], decision: null });
       restoredRef.current = false;
-      setMessage(samplePrompt);
+      setMessage("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not restart chat");
     } finally {
@@ -222,13 +235,12 @@ export default function ChatPanel({
           <p className="eyebrow">Customer Chat</p>
           <h2>Interactive AI Assistant</h2>
           <p className="muted">
-            Ask about policy, or start a return/exchange by mentioning an order ID, product name, or
-            SKU.
+            I can help with returns, exchanges, order questions, and Shopward policy.
           </p>
         </div>
         <div className="chat-heading-actions">
           <button type="button" className="ghost-button" onClick={() => setMessage(samplePrompt)}>
-            Policy sample
+            Sample question
           </button>
           <button type="button" className="ghost-button" disabled={loading} onClick={() => void restartChat()}>
             Restart chat
@@ -238,8 +250,9 @@ export default function ChatPanel({
 
       <div className="chat-history">
         {messages.length === 0 ? (
-          <div className="empty-state">
-            Try “What is the return window for VIP customers?” or “I want to return Yoga Mat”.
+          <div className="empty-state chat-welcome">
+            <strong>{chatGreeting(customerName)}</strong>
+            <p className="muted">{chatEmptyStateHint(customerName)}</p>
           </div>
         ) : (
           messages.map((item, index) => (
@@ -277,14 +290,7 @@ export default function ChatPanel({
         return <ImageUploadPrompt key={action.id} action={action} disabled={loading} onUpload={uploadImage} />;
       })}
 
-      {decision ? (
-        <div className={`decision-card ${decision.status}`}>
-          <strong>{formatDecisionStatus(decision.status)}</strong>
-          <span>Order: {decision.order_id}</span>
-          <span>Amount: {decision.amount > 0 ? `$${decision.amount.toFixed(2)}` : "$0.00"}</span>
-          <span>{decision.customer_message}</span>
-        </div>
-      ) : null}
+      {decision ? <RefundDecisionCard decision={decision} /> : null}
 
       {error ? <div className="error-banner">{error}</div> : null}
 
@@ -301,7 +307,7 @@ export default function ChatPanel({
         <textarea
           value={message}
           onChange={(event) => setMessage(event.target.value)}
-          placeholder="Ask about policy, returns, exchanges, or a product..."
+          placeholder={chatInputPlaceholder(customerName)}
           rows={1}
         />
         <button type="submit" className="send-button" disabled={loading || !token}>
@@ -310,20 +316,6 @@ export default function ChatPanel({
       </form>
     </section>
   );
-}
-
-function formatDecisionStatus(status: string): string {
-  switch (status.toLowerCase()) {
-    case "approved":
-      return "Approved";
-    case "denied":
-      return "Denied";
-    case "manual_review":
-    case "manager_review":
-      return "Under review";
-    default:
-      return status.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
-  }
 }
 
 function MessageContent({ content }: { content: string }) {

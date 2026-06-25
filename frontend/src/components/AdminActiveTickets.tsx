@@ -6,9 +6,24 @@ import {
   rejectAdminTicket,
 } from "../lib/api";
 import TicketEvidenceGallery from "./TicketEvidenceGallery";
+
 type Props = {
   token: string;
 };
+
+function formatRiskLevel(level: string | null | undefined): string {
+  if (!level) {
+    return "Unknown";
+  }
+  return level.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function formatRefundOutcome(outcome: string | null | undefined): string {
+  if (!outcome) {
+    return "Unknown";
+  }
+  return outcome.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
 
 export default function AdminActiveTickets({ token }: Props) {
   const [tickets, setTickets] = useState<AdminTicket[]>([]);
@@ -75,6 +90,7 @@ export default function AdminActiveTickets({ token }: Props) {
   const reviewCount = tickets.filter((ticket) =>
     ["Manual Review", "Manager Review"].includes(ticket.status),
   ).length;
+  const fraudCount = tickets.filter((ticket) => ticket.fraud_flagged).length;
 
   return (
     <div className="page-stack">
@@ -94,6 +110,11 @@ export default function AdminActiveTickets({ token }: Props) {
           <strong>{reviewCount}</strong>
           <small>Needs specialist review</small>
         </article>
+        <article className="metric-card">
+          <span>Fraud Flagged</span>
+          <strong>{fraudCount}</strong>
+          <small>High or critical risk</small>
+        </article>
       </section>
 
       <section className="panel admin-tickets-panel">
@@ -101,7 +122,10 @@ export default function AdminActiveTickets({ token }: Props) {
           <div>
             <p className="eyebrow">Returns Queue</p>
             <h2>Active return requests</h2>
-            <p className="muted">Approve or reject customer return tickets. Customers see your decision on their Active Tickets page.</p>
+            <p className="muted">
+              Approve or reject customer return tickets. Each ticket includes AI reasoning from the refund rule
+              engine and anti-fraud policy engine when available.
+            </p>
           </div>
           <button type="button" className="secondary-button" onClick={() => void loadTickets()} disabled={loading}>
             Refresh
@@ -117,12 +141,22 @@ export default function AdminActiveTickets({ token }: Props) {
         ) : (
           <div className="ticket-grid">
             {tickets.map((ticket) => (
-              <article key={ticket.request_id} className="ticket-card admin-ticket-card">
+              <article
+                key={ticket.request_id}
+                className={`ticket-card admin-ticket-card ${ticket.fraud_flagged ? "fraud-flagged" : ""}`}
+              >
                 <div className="ticket-card-header">
                   <strong>{ticket.request_id}</strong>
-                  <span className={`ticket-status ${ticket.status.toLowerCase().replace(/\s+/g, "-")}`}>
-                    {ticket.status}
-                  </span>
+                  <div className="ticket-header-badges">
+                    {ticket.fraud_flagged ? (
+                      <span className={`fraud-risk-badge ${(ticket.fraud_risk_level ?? "high").toLowerCase()}`}>
+                        Fraud · {formatRiskLevel(ticket.fraud_risk_level)}
+                      </span>
+                    ) : null}
+                    <span className={`ticket-status ${ticket.status.toLowerCase().replace(/\s+/g, "-")}`}>
+                      {ticket.status}
+                    </span>
+                  </div>
                 </div>
                 <span>{ticket.customer_name} · {ticket.customer_email}</span>
                 <span>{ticket.product_names || "Order items"}</span>
@@ -131,6 +165,79 @@ export default function AdminActiveTickets({ token }: Props) {
                 <span>Requested: {ticket.request_date}</span>
                 <span>Reason: {ticket.reason}</span>
                 <span>Order value: ${ticket.total_amount.toFixed(2)}</span>
+                {ticket.refund_evaluated ? (
+                  <div className="refund-assessment-panel">
+                    <div className="refund-assessment-header">
+                      <strong>AI Reasoning for Refund</strong>
+                      <span>{formatRefundOutcome(ticket.refund_outcome)}</span>
+                    </div>
+                    {ticket.refund_reasoning ? (
+                      <pre className="refund-reasoning">{ticket.refund_reasoning}</pre>
+                    ) : null}
+                    {ticket.refund_signals && ticket.refund_signals.length > 0 ? (
+                      <details className="refund-signals-details">
+                        <summary>Triggered refund rules ({ticket.refund_signals.length})</summary>
+                        <ul>
+                          {ticket.refund_signals.map((signal) => (
+                            <li key={signal.rule_id}>
+                              <strong>{signal.category}</strong>: {signal.description} ({signal.outcome})
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    ) : null}
+                    {ticket.refund_policy_citations && ticket.refund_policy_citations.length > 0 ? (
+                      <details className="refund-policy-details">
+                        <summary>Refund policy citations</summary>
+                        {ticket.refund_policy_citations.map((section) => (
+                          <article
+                            key={String(section.chunk_id ?? section.section_title)}
+                            className="refund-policy-citation"
+                          >
+                            <strong>{section.section_title}</strong>
+                            <p>{section.content.split("\n")[0]}</p>
+                          </article>
+                        ))}
+                      </details>
+                    ) : null}
+                  </div>
+                ) : null}
+                {ticket.fraud_flagged ? (
+                  <div className="fraud-assessment-panel">
+                    <div className="fraud-assessment-header">
+                      <strong>Anti-Fraud Assessment</strong>
+                      <span>
+                        Score {ticket.fraud_score ?? 0}/100 · {formatRiskLevel(ticket.fraud_risk_level)}
+                      </span>
+                    </div>
+                    {ticket.fraud_reasoning ? (
+                      <pre className="fraud-reasoning">{ticket.fraud_reasoning}</pre>
+                    ) : null}
+                    {ticket.fraud_signals && ticket.fraud_signals.length > 0 ? (
+                      <details className="fraud-signals-details">
+                        <summary>Triggered rules ({ticket.fraud_signals.length})</summary>
+                        <ul>
+                          {ticket.fraud_signals.map((signal) => (
+                            <li key={signal.rule_id}>
+                              <strong>{signal.category}</strong>: {signal.description} (+{signal.score_delta})
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    ) : null}
+                    {ticket.fraud_policy_citations && ticket.fraud_policy_citations.length > 0 ? (
+                      <details className="fraud-policy-details">
+                        <summary>Policy citations</summary>
+                        {ticket.fraud_policy_citations.map((section) => (
+                          <article key={String(section.chunk_id ?? section.section_title)} className="fraud-policy-citation">
+                            <strong>{section.section_title}</strong>
+                            <p>{section.content.split("\n")[0]}</p>
+                          </article>
+                        ))}
+                      </details>
+                    ) : null}
+                  </div>
+                ) : null}
                 {ticket.customer_comment ? (
                   <p className="ticket-comment">{ticket.customer_comment}</p>
                 ) : (

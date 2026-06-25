@@ -5,6 +5,8 @@ import BrandLogo from "./components/BrandLogo";
 import LoginPage from "./components/LoginPage";
 import PolicySectionContent from "./components/PolicySectionContent";
 import TicketEvidenceGallery from "./components/TicketEvidenceGallery";
+import TicketSupportFallback from "./components/TicketSupportFallback";
+import VoicePanel from "./components/VoicePanel";
 import {
   ActiveTicket,
   AssistantAction,
@@ -20,6 +22,7 @@ import {
   getMe,
   getPolicySections,
   logout as logoutSession,
+  splitCustomerTickets,
   updateActiveTicket,
 } from "./lib/api";
 import { fileToEvidenceUpload } from "./lib/evidence";
@@ -35,7 +38,7 @@ function navLabel(page: Page): string {
     return "Active Tickets";
   }
   if (page === "PolicySections") {
-    return "Policy Sections";
+    return "Shopward Policies";
   }
   return page;
 }
@@ -50,7 +53,7 @@ function pageTitle(page: Page): string {
   if (page === "ActiveTickets") {
     return "Active Tickets";
   }
-  return "Return Policy";
+  return "Shopward Policies";
 }
 
 function pageSubtitle(page: Page): string {
@@ -61,9 +64,9 @@ function pageSubtitle(page: Page): string {
     return "View everything you have purchased from Shopward.";
   }
   if (page === "ActiveTickets") {
-    return "Track open return requests and update ticket details.";
+    return "Track open return requests or review past refund outcomes.";
   }
-  return "Browse Shopward return and refund policy sections.";
+  return "Browse Shopward customer policies for returns, refunds, and more.";
 }
 
 export default function App() {
@@ -273,6 +276,7 @@ export default function App() {
             chatDecision={chatDecision}
             onChatStateChange={updateChatState}
             onSessionRestore={restoreAssistantSession}
+            onDecision={refreshActiveTickets}
           />
         ) : null}
 
@@ -326,6 +330,7 @@ function DashboardPage({
   chatDecision,
   onChatStateChange,
   onSessionRestore,
+  onDecision,
 }: {
   customer: Customer;
   purchasedItems: Array<Customer["orders"][number]["items"][number] & { orderId: string; orderTotal: number }>;
@@ -340,6 +345,7 @@ function DashboardPage({
     decision: RefundDecision | null;
   }) => void;
   onSessionRestore: () => Promise<void>;
+  onDecision: () => void;
 }) {
   return (
     <div className="dashboard-grid">
@@ -349,14 +355,19 @@ function DashboardPage({
         <Metric label="Refunds" value={customer.refund_count_last_12_months.toString()} detail="Last 12 months" />
       </section>
 
-      <ChatPanel
-        token={token}
-        messages={chatMessages}
-        actions={chatActions}
-        decision={chatDecision}
-        onStateChange={onChatStateChange}
-        onSessionRestore={onSessionRestore}
-      />
+      <div className="dashboard-support-grid">
+        <ChatPanel
+          token={token}
+          customerName={customer.name}
+          messages={chatMessages}
+          actions={chatActions}
+          decision={chatDecision}
+          onStateChange={onChatStateChange}
+          onSessionRestore={onSessionRestore}
+          onDecision={onDecision}
+        />
+        <VoicePanel token={token} onDecision={onDecision} />
+      </div>
     </div>
   );
 }
@@ -428,9 +439,13 @@ function ActiveTicketsPage({
   token: string;
   onUpdated: () => void;
 }) {
-  const pendingCount = tickets.filter((ticket) => ticket.status === "Pending").length;
-  const approvedCount = tickets.filter((ticket) => ticket.status === "Approved").length;
-  const deniedCount = tickets.filter((ticket) => ticket.status === "Denied").length;
+  const { open: openTickets, past: pastTickets } = splitCustomerTickets(tickets);
+  const pendingCount = openTickets.filter((ticket) => ticket.status === "Pending").length;
+  const reviewCount = openTickets.filter((ticket) =>
+    ["Manual Review", "Manager Review"].includes(ticket.status),
+  ).length;
+  const approvedCount = pastTickets.filter((ticket) => ticket.status === "Approved").length;
+  const deniedCount = pastTickets.filter((ticket) => ticket.status === "Denied").length;
   const [savingTicketId, setSavingTicketId] = useState("");
   const [cancellingTicketId, setCancellingTicketId] = useState("");
   const [draftDescriptions, setDraftDescriptions] = useState<Record<string, string>>({});
@@ -460,17 +475,13 @@ function ActiveTicketsPage({
     onUpdated();
   }
 
-  function isEditableTicket(status: string): boolean {
-    return ["Pending", "Manual Review", "Manager Review"].includes(status);
-  }
-
   return (
     <div className="page-stack">
       <section className="metric-row">
-        <Metric label="Active Tickets" value={tickets.length.toString()} detail="Return requests" />
+        <Metric label="Active Tickets" value={openTickets.length.toString()} detail="Open requests" />
         <Metric label="Pending" value={pendingCount.toString()} detail="Awaiting review" />
-        <Metric label="Approved" value={approvedCount.toString()} detail="Refund accepted" />
-        <Metric label="Rejected" value={deniedCount.toString()} detail="Refund denied" />
+        <Metric label="In Review" value={reviewCount.toString()} detail="Needs specialist review" />
+        <Metric label="Past Tickets" value={pastTickets.length.toString()} detail="Accepted or rejected" />
       </section>
       <section className="panel">
         <div className="panel-heading">
@@ -479,106 +490,176 @@ function ActiveTicketsPage({
             <h2>Your active tickets</h2>
           </div>
         </div>
-        {tickets.length === 0 ? (
+        {openTickets.length === 0 ? (
           <p className="muted">You do not have any active return or refund tickets right now.</p>
         ) : (
           <div className="ticket-grid">
-            {tickets.map((ticket) => (
-              <article key={ticket.request_id} className="ticket-card">
-                <div className="ticket-card-header">
-                  <strong>{ticket.request_id}</strong>
-                  <span className={`ticket-status ${ticket.status.toLowerCase().replace(/\s+/g, "-")}`}>
-                    {ticket.status}
-                  </span>
-                </div>
-                {ticket.status === "Approved" ? (
-                  <div className="ticket-decision-banner approved">
-                    <strong>Refund Accepted</strong>
-                    <p>
-                      {ticket.admin_message ??
-                        `Refund of $${ticket.total_amount.toFixed(2)} will be transferred to your original bank account within 5-7 business days.`}
-                    </p>
-                  </div>
-                ) : null}
-                {ticket.status === "Denied" ? (
-                  <div className="ticket-decision-banner denied">
-                    <strong>Refund Rejected</strong>
-                    <p>{ticket.admin_message ?? "Your return request was not approved."}</p>
-                  </div>
-                ) : null}
-                <span>{ticket.product_names || "Order items"}</span>
-                <span>Order: {ticket.order_id}</span>
-                <span>Requested: {ticket.request_date}</span>
-                <span>Reason: {ticket.reason}</span>
-                <span>Resolution: {ticket.requested_resolution}</span>
-                {isEditableTicket(ticket.status) ? (
-                  <>
-                <label className="ticket-edit-field">
-                  Description
-                  <textarea
-                    value={descriptionFor(ticket)}
-                    onChange={(event) =>
-                      setDraftDescriptions((current) => ({
-                        ...current,
-                        [ticket.request_id]: event.target.value,
-                      }))
-                    }
-                    rows={3}
-                    placeholder="Add or update ticket details..."
-                  />
-                </label>
-                <TicketEvidenceGallery evidence={ticket.evidence} token={token} />
-                {filesFor(ticket).length > 0 ? (
-                  <small className="muted">
-                    New selection: {filesFor(ticket).map((file) => file.file_name).join(", ")}
-                  </small>
-                ) : null}
-                <input
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  onChange={(event) => {
-                    void (async () => {
-                      const files = await Promise.all(
-                        Array.from(event.target.files ?? []).map(fileToEvidenceUpload),
-                      );
-                      setDraftFiles((current) => ({ ...current, [ticket.request_id]: files }));
-                    })();
-                  }}
-                />
-                <div className="ticket-actions">
-                  <button
-                    type="button"
-                    className="secondary-button ticket-save-button"
-                    disabled={savingTicketId === ticket.request_id || cancellingTicketId === ticket.request_id}
-                    onClick={() => void saveTicket(ticket)}
-                  >
-                    {savingTicketId === ticket.request_id ? "Saving..." : "Save changes"}
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost-button ticket-cancel-button"
-                    disabled={savingTicketId === ticket.request_id || cancellingTicketId === ticket.request_id}
-                    onClick={() => void cancelTicket(ticket)}
-                  >
-                    {cancellingTicketId === ticket.request_id ? "Cancelling..." : "Cancel ticket"}
-                  </button>
-                </div>
-                  </>
-                ) : (
-                  <>
-                    {ticket.customer_comment ? (
-                      <p className="ticket-comment">{ticket.customer_comment}</p>
-                    ) : null}
-                    <TicketEvidenceGallery evidence={ticket.evidence} token={token} />
-                  </>
-                )}
-              </article>
+            {openTickets.map((ticket) => (
+              <CustomerTicketCard
+                key={ticket.request_id}
+                ticket={ticket}
+                token={token}
+                editable
+                description={descriptionFor(ticket)}
+                pendingFiles={filesFor(ticket)}
+                saving={savingTicketId === ticket.request_id}
+                cancelling={cancellingTicketId === ticket.request_id}
+                onDescriptionChange={(value) =>
+                  setDraftDescriptions((current) => ({
+                    ...current,
+                    [ticket.request_id]: value,
+                  }))
+                }
+                onFilesSelected={(files) =>
+                  setDraftFiles((current) => ({ ...current, [ticket.request_id]: files }))
+                }
+                onSave={() => void saveTicket(ticket)}
+                onCancel={() => void cancelTicket(ticket)}
+              />
             ))}
           </div>
         )}
       </section>
+      <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">History</p>
+            <h2>Past tickets</h2>
+          </div>
+        </div>
+        {pastTickets.length === 0 ? (
+          <p className="muted">Accepted and rejected refund requests will appear here.</p>
+        ) : (
+          <>
+            {(approvedCount > 0 || deniedCount > 0) ? (
+              <p className="muted ticket-history-summary">
+                {approvedCount > 0 ? `${approvedCount} accepted` : null}
+                {approvedCount > 0 && deniedCount > 0 ? " · " : null}
+                {deniedCount > 0 ? `${deniedCount} rejected` : null}
+              </p>
+            ) : null}
+            <div className="ticket-grid">
+              {pastTickets.map((ticket) => (
+                <CustomerTicketCard key={ticket.request_id} ticket={ticket} token={token} />
+              ))}
+            </div>
+          </>
+        )}
+      </section>
     </div>
+  );
+}
+
+function CustomerTicketCard({
+  ticket,
+  token,
+  editable = false,
+  description = "",
+  pendingFiles = [],
+  saving = false,
+  cancelling = false,
+  onDescriptionChange,
+  onFilesSelected,
+  onSave,
+  onCancel,
+}: {
+  ticket: ActiveTicket;
+  token: string;
+  editable?: boolean;
+  description?: string;
+  pendingFiles?: EvidenceUpload[];
+  saving?: boolean;
+  cancelling?: boolean;
+  onDescriptionChange?: (value: string) => void;
+  onFilesSelected?: (files: EvidenceUpload[]) => void;
+  onSave?: () => void;
+  onCancel?: () => void;
+}) {
+  return (
+    <article key={ticket.request_id} className="ticket-card">
+      <div className="ticket-card-header">
+        <strong>{ticket.request_id}</strong>
+        <span className={`ticket-status ${ticket.status.toLowerCase().replace(/\s+/g, "-")}`}>
+          {ticket.status}
+        </span>
+      </div>
+      {ticket.status === "Approved" ? (
+        <div className="ticket-decision-banner approved">
+          <strong>Refund Accepted</strong>
+          <p>
+            {ticket.admin_message ??
+              `Refund of $${ticket.total_amount.toFixed(2)} will be transferred to your original bank account within 5-7 business days.`}
+          </p>
+        </div>
+      ) : null}
+      {ticket.status === "Denied" ? (
+        <div className="ticket-decision-banner denied">
+          <strong>Refund Rejected</strong>
+          <p>{ticket.admin_message ?? "Your return request was not approved."}</p>
+          <TicketSupportFallback />
+        </div>
+      ) : null}
+      <span>{ticket.product_names || "Order items"}</span>
+      <span>Order: {ticket.order_id}</span>
+      <span>Requested: {ticket.request_date}</span>
+      <span>Reason: {ticket.reason}</span>
+      <span>Resolution: {ticket.requested_resolution}</span>
+      {editable ? (
+        <>
+          <label className="ticket-edit-field">
+            Description
+            <textarea
+              value={description}
+              onChange={(event) => onDescriptionChange?.(event.target.value)}
+              rows={3}
+              placeholder="Add or update ticket details..."
+            />
+          </label>
+          <TicketEvidenceGallery evidence={ticket.evidence} token={token} />
+          {pendingFiles.length > 0 ? (
+            <small className="muted">
+              New selection: {pendingFiles.map((file) => file.file_name).join(", ")}
+            </small>
+          ) : null}
+          <input
+            type="file"
+            accept="image/*"
+            multiple
+            onChange={(event) => {
+              void (async () => {
+                const files = await Promise.all(
+                  Array.from(event.target.files ?? []).map(fileToEvidenceUpload),
+                );
+                onFilesSelected?.(files);
+              })();
+            }}
+          />
+          <div className="ticket-actions">
+            <button
+              type="button"
+              className="secondary-button ticket-save-button"
+              disabled={saving || cancelling}
+              onClick={onSave}
+            >
+              {saving ? "Saving..." : "Save changes"}
+            </button>
+            <button
+              type="button"
+              className="ghost-button ticket-cancel-button"
+              disabled={saving || cancelling}
+              onClick={onCancel}
+            >
+              {cancelling ? "Cancelling..." : "Cancel ticket"}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          {ticket.customer_comment ? <p className="ticket-comment">{ticket.customer_comment}</p> : null}
+          <TicketEvidenceGallery evidence={ticket.evidence} token={token} />
+        </>
+      )}
+    </article>
   );
 }
 
@@ -603,7 +684,7 @@ function PolicySectionsPage({ sections }: { sections: PolicySection[] }) {
         <div className="panel-heading">
           <div>
             <p className="eyebrow">Knowledge Base</p>
-            <h2>Return & refund policy</h2>
+            <h2>Shopward Policies</h2>
           </div>
         </div>
         <div className="policy-section-list">

@@ -132,10 +132,68 @@ export type ActiveTicket = {
   evidence: TicketEvidence[];
 };
 
+const OPEN_TICKET_STATUSES = new Set(["Pending", "Manual Review", "Manager Review"]);
+const PAST_TICKET_STATUSES = new Set(["Approved", "Denied"]);
+
+export function isOpenTicket(status: string): boolean {
+  return OPEN_TICKET_STATUSES.has(status);
+}
+
+export function isPastTicket(status: string): boolean {
+  return PAST_TICKET_STATUSES.has(status);
+}
+
+export function splitCustomerTickets(tickets: ActiveTicket[]) {
+  return {
+    open: tickets.filter((ticket) => isOpenTicket(ticket.status)),
+    past: tickets.filter((ticket) => isPastTicket(ticket.status)),
+  };
+}
+
+export type RefundRuleSignal = {
+  rule_id: string;
+  category: string;
+  description: string;
+  outcome: string;
+};
+
+export type RefundPolicyCitation = {
+  chunk_id?: string;
+  section_title: string;
+  content: string;
+  score?: number;
+};
+
 export type AdminTicket = ActiveTicket & {
   customer_id: string;
   customer_name: string;
   customer_email: string;
+  fraud_flagged?: boolean;
+  fraud_score?: number | null;
+  fraud_risk_level?: string | null;
+  fraud_reasoning?: string | null;
+  fraud_signals?: FraudSignal[];
+  fraud_policy_citations?: FraudPolicyCitation[];
+  refund_evaluated?: boolean;
+  refund_outcome?: string | null;
+  refund_reasoning?: string | null;
+  refund_signals?: RefundRuleSignal[];
+  refund_policy_citations?: RefundPolicyCitation[];
+};
+
+export type FraudSignal = {
+  rule_id: string;
+  category: string;
+  description: string;
+  score_delta: number;
+  severity: string;
+};
+
+export type FraudPolicyCitation = {
+  chunk_id?: string;
+  section_title: string;
+  content: string;
+  score?: number;
 };
 
 export type AssistantOption = {

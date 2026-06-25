@@ -16,6 +16,7 @@ class AssistantSessionMemory(BaseModel):
     selected_product_name: str | None = None
     selected_reason: str | None = None
     uploaded_evidence: dict[str, Any] | None = None
+    evidence_retry_count: int = 0
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
     def remember(self, role: str, content: str) -> None:
@@ -31,6 +32,7 @@ class AssistantSessionMemory(BaseModel):
             "selected_product_name": self.selected_product_name,
             "selected_reason": self.selected_reason,
             "uploaded_evidence": self.uploaded_evidence,
+            "evidence_retry_count": self.evidence_retry_count,
         }
 
 

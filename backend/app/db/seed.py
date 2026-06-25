@@ -194,6 +194,8 @@ def seed_demo_data(reset: bool = False) -> None:
     with get_connection() as connection:
         if reset:
             for table in (
+                "RefundEvaluationRun",
+                "FraudDetectionRun",
                 "AgentDecisionLog",
                 "PolicyIndexMetadata",
                 "PolicyChunk",

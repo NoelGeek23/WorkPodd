@@ -6,8 +6,19 @@ from difflib import SequenceMatcher
 from datetime import date
 from uuid import uuid4
 
+from app.agent.conversational import (
+    is_conversational_message,
+    try_conversational_response,
+    unable_to_answer_response,
+)
 from app.agent.graph import run_refund_agent
 from app.agent.session_memory import AssistantSessionMemory
+from app.agent.tools import (
+    CANCELLABLE_TICKET_STATUSES,
+    cancel_customer_ticket,
+    get_customer_ticket,
+    list_customer_tickets,
+)
 from app.db.database import get_connection
 from app.models import (
     AssistantAction,
@@ -18,10 +29,23 @@ from app.models import (
     InteractiveChatRequest,
     InteractiveChatResponse,
     InteractiveUploadRequest,
+    ToolCallLog,
 )
-from app.rag.policy_index import format_policy_topic, retrieve_policy_sections, validate_policy_answer
+from app.rag.policy_index import (
+    format_policy_topic,
+    retrieve_customer_policy_sections,
+    validate_policy_answer,
+)
+from app.services.customer_decisions import public_refund_decision
 from app.services.evidence_store import persist_ticket_evidence
+from app.services.evidence_verification import (
+    EvidenceVerificationResult,
+    normalize_product_names,
+    verify_evidence_image,
+)
 from app.services.log_bus import log_bus
+from app.services.product_classification import is_hygiene_sensitive_product
+from app.services.refund_decisions import apply_refund_decision
 
 RETURN_REASONS = [
     AssistantOption(
@@ -128,6 +152,20 @@ CONTACT_OPTIONS = [
     AssistantOption(id="email_support", label="Email", description="Send your question to support."),
 ]
 
+TICKET_TERMS = {
+    "ticket",
+    "tickets",
+    "return request",
+    "return requests",
+}
+
+TICKET_CANCEL_TERMS = {
+    "cancel",
+    "close",
+    "withdraw",
+    "remove",
+}
+
 SUPPORT_SCOPE_TERMS = POLICY_SCOPE_TERMS | PURCHASE_TERMS | RETURN_TERMS | {
     "account",
     "address",
@@ -138,6 +176,34 @@ SUPPORT_SCOPE_TERMS = POLICY_SCOPE_TERMS | PURCHASE_TERMS | RETURN_TERMS | {
     "support",
     "tracking",
 }
+
+
+def _first_name(customer: CustomerProfile) -> str:
+    name = customer.name.strip()
+    return name.split()[0] if name else "there"
+
+
+def _tier_label(customer: CustomerProfile) -> str:
+    return customer.loyalty_tier.value.replace("_", " ").title()
+
+
+def _is_vip_customer(customer: CustomerProfile) -> bool:
+    return (
+        customer.lifetime_value > 5000
+        or "vip" in customer.notes.lower()
+        or customer.loyalty_tier.value in {"gold", "platinum", "vip"}
+    )
+
+
+def _vip_return_window_note(customer: CustomerProfile) -> str:
+    return (
+        f"As a {_tier_label(customer)} member, you have a 45-day return window on eligible purchases. "
+        "Final sale, gift card, and digital product restrictions still apply."
+    )
+
+
+def _hi(customer: CustomerProfile) -> str:
+    return f"Hi {_first_name(customer)}"
 
 
 def _log_reasoning(
@@ -159,6 +225,26 @@ def _log_reasoning(
             customer_id=customer_id,
             order_id=order_id,
             metadata=metadata,
+        )
+    )
+
+
+def _log_tool_call(
+    customer_id: str | None,
+    order_id: str | None,
+    call: ToolCallLog,
+) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(
+        log_bus.publish(
+            "tool_call",
+            f"Tool `{call.tool}` returned {call.output}",
+            customer_id=customer_id,
+            order_id=order_id,
+            metadata=call.model_dump(mode="json"),
         )
     )
 
@@ -191,7 +277,7 @@ async def handle_interactive_chat(
                 "workflow_state": memory.workflow_state,
             },
         )
-        return _handle_return_details(customer, memory, request)
+        return await _handle_return_details(customer, memory, request)
 
     if request.selected_option:
         _log_reasoning(
@@ -205,7 +291,10 @@ async def handle_interactive_chat(
 
     message = (request.message or "").strip()
     if not message:
-        return _assistant_response(memory, "Tell me what you need help with.")
+        return _assistant_response(
+            memory,
+            f"{_hi(customer)}, tell me what you'd like help with today.",
+        )
 
     _log_reasoning(
         "message_received",
@@ -242,6 +331,18 @@ async def handle_interactive_chat(
     if intent == "return_exchange_request":
         return _start_return_exchange(customer, memory, message)
 
+    if intent == "ticket_request":
+        return await _handle_ticket_request(customer, memory, message)
+
+    if intent == "conversational":
+        return await try_conversational_response(customer, memory, message) or unable_to_answer_response(
+            memory, customer
+        )
+
+    conversational = await try_conversational_response(customer, memory, message)
+    if conversational:
+        return conversational
+
     if _is_support_scope_query(message):
         return _contact_support_response(
             memory,
@@ -249,10 +350,10 @@ async def handle_interactive_chat(
             customer_id=customer.id,
         )
 
-    return _unable_to_answer(memory)
+    return unable_to_answer_response(memory, customer)
 
 
-def handle_interactive_upload(
+async def handle_interactive_upload(
     customer: CustomerProfile,
     memory: AssistantSessionMemory,
     upload: InteractiveUploadRequest,
@@ -267,6 +368,7 @@ def handle_interactive_upload(
             "content_type": upload.content_type,
             "size": upload.size,
             "workflow_state": memory.workflow_state,
+            "evidence_retry_count": memory.evidence_retry_count,
         },
     )
     if not upload.content_type.startswith("image/"):
@@ -290,37 +392,79 @@ def handle_interactive_upload(
         )
         return _assistant_response(memory, "That image is too large for the demo. Please upload one under 5 MB.")
 
+    ticket_id = None
+    if memory.selected_order_id:
+        ticket = _active_ticket_for_order(customer.id, memory.selected_order_id)
+        ticket_id = str(ticket["request_id"]) if ticket else None
+
+    if upload.data_base64:
+        verification = _verify_uploaded_image(customer, memory, data_base64=upload.data_base64)
+        _log_reasoning(
+            "evidence_verification",
+            "Ran OpenCV/ViT evidence verification on uploaded image.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={
+                "passed": verification.passed,
+                "issue": verification.issue,
+                "detected_objects": verification.detected_objects,
+                "retries_remaining": verification.retries_remaining,
+            },
+        )
+        if not verification.passed:
+            if verification.retries_remaining <= 0:
+                return _escalate_evidence_failure(
+                    customer,
+                    memory,
+                    ticket_id,
+                    verification.customer_message,
+                )
+            return _image_retry_response(memory, verification, ticket_id=ticket_id)
+
+    memory.evidence_retry_count = 0
     memory.uploaded_evidence = {
         "file_name": upload.file_name,
         "content_type": upload.content_type,
         "size": upload.size,
         "image_engine": {
+            "verification_passed": True,
             "damage_detected": True,
             "confidence": 0.91,
-            "requires_manual_review": True,
+            "requires_manual_review": memory.workflow_state != "awaiting_packaging_image",
         },
     }
-    if upload.data_base64 and memory.selected_order_id:
-        ticket = _active_ticket_for_order(customer.id, memory.selected_order_id)
-        if ticket:
-            with get_connection() as connection:
-                persist_ticket_evidence(
-                    connection,
-                    str(ticket["request_id"]),
-                    [upload],
-                )
+    if upload.data_base64 and ticket_id:
+        with get_connection() as connection:
+            persist_ticket_evidence(
+                connection,
+                ticket_id,
+                [upload],
+            )
+
+    if memory.workflow_state in {
+        "awaiting_packaging_image",
+        "awaiting_damage_image",
+        "awaiting_wrong_item_image",
+    }:
+        memory.workflow_state = "ticket_updated"
+        content = (
+            f"Thanks, {_first_name(customer)}. Your image passed verification and is attached to the ticket. "
+            "I'll check it against the refund policy now."
+        )
+        return await _run_existing_refund_flow(customer, memory, content)
+
     memory.workflow_state = "manual_review_escalated"
     _log_reasoning(
         "escalation",
-        "Image evidence attached and case routed for manual review.",
+        "Verified image evidence attached and case routed for manual review.",
         customer_id=customer.id,
         order_id=memory.selected_order_id,
         metadata=memory.uploaded_evidence,
     )
 
     content = (
-        "Thanks, I attached the image evidence. This case needs a support specialist to review the "
-        "damage details, so I’m escalating it for follow-up."
+        f"Thanks, {_first_name(customer)}. I attached the verified image evidence. This case needs a support "
+        "specialist to review the damage details, so I'm escalating it for follow-up."
     )
     memory.remember("assistant", content)
     return InteractiveChatResponse(
@@ -333,6 +477,10 @@ def handle_interactive_upload(
 
 
 def _classify_intent(message: str) -> str:
+    if _is_ticket_request(message):
+        return "ticket_request"
+    if is_conversational_message(message):
+        return "conversational"
     lowered = message.lower()
     if "want to know" in lowered or lowered.startswith(("what ", "how ", "when ", "which ")):
         if any(term in lowered for term in POLICY_TERMS):
@@ -373,16 +521,19 @@ def _answer_purchase_query(
     ranked_index = _ranked_purchase_index(lowered)
     if ranked_index is not None:
         selected_orders = orders[ranked_index : ranked_index + 1]
-        intro = f"Your {_ranked_purchase_label(ranked_index)} is:"
+        intro = f"{_hi(customer)}, your {_ranked_purchase_label(ranked_index).lower()} is:"
     elif "last" in lowered or "latest" in lowered or "most recent" in lowered:
         selected_orders = orders[:1]
-        intro = "Your most recent purchase is:"
+        intro = f"{_hi(customer)}, your most recent purchase is:"
     elif "return" in lowered or "eligible" in lowered:
         selected_orders = [order for order in orders if _has_potentially_returnable_item(order)]
-        intro = "Based on product type and basic exclusions, these purchases may be worth checking for return eligibility:"
+        intro = (
+            f"{_hi(customer)}, based on your account these purchases may be worth checking "
+            "for return eligibility:"
+        )
     else:
         selected_orders = orders[:5]
-        intro = "Here are your recent purchases:"
+        intro = f"{_hi(customer)}, here are your recent purchases:"
 
     _log_reasoning(
         "purchase_lookup",
@@ -397,7 +548,7 @@ def _answer_purchase_query(
 
     if not selected_orders:
         content = (
-            "I could not find a matching purchase list for that request.\n\n"
+            f"{_hi(customer)}, I could not find a matching purchase list for that request.\n\n"
             "Try asking for your last purchase, recent purchases, or which items may be returnable."
         )
         memory.remember("assistant", content)
@@ -415,7 +566,7 @@ def _answer_purchase_query(
     content = (
         f"{intro}\n\n"
         + "\n\n".join(lines)
-        + "\n\nIf you want to start a return or exchange, say something like: "
+        + f"\n\nIf you'd like to start a return or exchange, {_first_name(customer)}, say something like: "
         "\"I want to return ord_5001\" or \"I want to return Yoga Mat\"."
     )
     memory.workflow_state = "answered_purchase_query"
@@ -430,12 +581,14 @@ def _has_potentially_returnable_item(order) -> bool:
         not item.final_sale
         and not item.digital_download
         and not item.subscription_product
-        and not (item.hygiene_sensitive and item.condition != "unopened")
+        and not (is_hygiene_sensitive_product(item) and item.condition != "unopened")
         for item in order.items
     )
 
 
 def _return_hint(order) -> str:
+    if order.status == "returned":
+        return "This order has already been returned."
     if order.status != "delivered":
         return "This is not delivered yet, so standard return checks may not apply."
     if not _has_potentially_returnable_item(order):
@@ -455,9 +608,9 @@ def _answer_policy_question(
                 "I could not find that topic in the Shopward return and refund policy.",
                 customer_id=customer.id,
             )
-        return _unable_to_answer(memory)
+        return unable_to_answer_response(memory, customer)
 
-    retrieved_sections = retrieve_policy_sections(message, limit=8)
+    retrieved_sections = retrieve_customer_policy_sections(message, limit=8)
     sections = _rank_policy_sections(message, retrieved_sections)[:3]
     validation = validate_policy_answer(message, sections)
     _log_reasoning(
@@ -489,7 +642,7 @@ def _answer_policy_question(
         )
         return _assistant_response(
             memory,
-            f"We do not have a {topic} in the Shopward return and refund policy.",
+            f"{_hi(customer)}, we do not have a {topic} in the Shopward return and refund policy.",
         )
 
     if validation["verdict"] == "unsure":
@@ -499,14 +652,20 @@ def _answer_policy_question(
             customer_id=customer.id,
             metadata={"message": message, "validation": validation},
         )
-        return _assistant_response(memory, "I am unable to answer that at this moment.")
+        return _assistant_response(
+            memory,
+            f"{_hi(customer)}, I am unable to answer that at this moment.",
+        )
 
     if not sections:
-        return _assistant_response(memory, "I am unable to answer that at this moment.")
+        return _assistant_response(
+            memory,
+            f"{_hi(customer)}, I am unable to answer that at this moment.",
+        )
 
     primary = sections[0]
     content_parts = [
-        "Here is what the Shopward policy says.",
+        f"{_hi(customer)}, here's what the Shopward policy says.",
         _format_policy_section_for_chat(primary["section_title"], primary["content"]),
     ]
 
@@ -520,11 +679,14 @@ def _answer_policy_question(
 
     lowered = message.lower()
     if "vip" in lowered or "return window" in lowered:
-        content_parts.append(
-            "VIP note: VIP customers may use a 45-day return window, but VIP status does not override "
-            "final sale restrictions, gift card restrictions, or digital product restrictions. VIP exception "
-            "requests may still require escalation."
-        )
+        if _is_vip_customer(customer):
+            content_parts.append(_vip_return_window_note(customer))
+        else:
+            content_parts.append(
+                "VIP note: VIP customers may use a 45-day return window, but VIP status does not override "
+                "final sale restrictions, gift card restrictions, or digital product restrictions. VIP exception "
+                "requests may still require escalation."
+            )
 
     content = "\n\n".join(content_parts)
     memory.workflow_state = "answered_policy_question"
@@ -626,11 +788,243 @@ def _rank_policy_sections(message: str, sections: list[dict]) -> list[dict]:
 
 def _is_support_scope_query(message: str) -> bool:
     lowered = message.lower()
+    if _is_ticket_request(message):
+        return False
     return any(term in lowered for term in SUPPORT_SCOPE_TERMS)
 
 
-def _unable_to_answer(memory: AssistantSessionMemory) -> InteractiveChatResponse:
-    return _assistant_response(memory, "I am unable to answer that.")
+def _extract_ticket_id(message: str) -> str | None:
+    match = re.search(r"\b(ret_[a-f0-9]{8})\b", message, flags=re.IGNORECASE)
+    return match.group(1).lower() if match else None
+
+
+def _is_ticket_request(message: str) -> bool:
+    lowered = message.lower()
+    if _extract_ticket_id(message):
+        return True
+    has_ticket = any(term in lowered for term in TICKET_TERMS)
+    if has_ticket:
+        return True
+    return any(term in lowered for term in TICKET_CANCEL_TERMS) and any(
+        phrase in lowered
+        for phrase in ("my last", "active ticket", "open ticket", "the ticket", "that ticket", "this ticket")
+    )
+
+
+def _is_ticket_cancel_request(message: str) -> bool:
+    lowered = message.lower()
+    return any(term in lowered for term in TICKET_CANCEL_TERMS)
+
+
+def _format_ticket_line(ticket: dict) -> str:
+    products = ticket.get("product_names") or "Order items"
+    return (
+        f"{ticket['request_id']}: {products} on order {ticket['order_id']}. "
+        f"Status: {ticket['status']}. Opened: {ticket['request_date']}."
+    )
+
+
+def _clear_ticket_session_state(memory: AssistantSessionMemory, request_id: str) -> None:
+    if memory.selected_order_id and memory.workflow_state not in {"idle", "answered_purchase_query"}:
+        memory.workflow_state = "idle"
+        memory.selected_reason = None
+        memory.selected_product_name = None
+        memory.uploaded_evidence = None
+        memory.evidence_retry_count = 0
+    _ = request_id
+
+
+def _product_name_for_verification(customer: CustomerProfile, memory: AssistantSessionMemory) -> str:
+    if memory.selected_product_name:
+        return normalize_product_names(memory.selected_product_name)
+    if memory.selected_order_id:
+        order = next((item for item in customer.orders if item.id == memory.selected_order_id), None)
+        if order:
+            return normalize_product_names(", ".join(item.name for item in order.items))
+    return "Order items"
+
+
+def _verify_uploaded_image(
+    customer: CustomerProfile,
+    memory: AssistantSessionMemory,
+    *,
+    data_base64: str,
+) -> EvidenceVerificationResult:
+    attempt_number = memory.evidence_retry_count + 1
+    return verify_evidence_image(
+        product_name=_product_name_for_verification(customer, memory),
+        data_base64=data_base64,
+        attempt_number=attempt_number,
+    )
+
+
+def _escalate_evidence_failure(
+    customer: CustomerProfile,
+    memory: AssistantSessionMemory,
+    ticket_id: str | None,
+    message: str,
+) -> InteractiveChatResponse:
+    if ticket_id:
+        with get_connection() as connection:
+            connection.execute(
+                """
+                UPDATE ReturnRequest
+                SET status = 'Manual Review'
+                WHERE request_id = ?
+                  AND customer_id = ?
+                """,
+                (ticket_id, customer.id),
+            )
+    memory.workflow_state = "manual_review_escalated"
+    memory.evidence_retry_count = 0
+    _log_reasoning(
+        "evidence_escalated",
+        "Image verification failed after maximum retries; escalated to manual review.",
+        customer_id=customer.id,
+        order_id=memory.selected_order_id,
+        metadata={"ticket_id": ticket_id, "workflow_state": memory.workflow_state},
+    )
+    content = (
+        f"{message} I've escalated this case to a support specialist for manual review."
+    )
+    memory.remember("assistant", content)
+    return InteractiveChatResponse(
+        messages=memory.messages,
+        actions=[],
+        citations=[],
+        decision=None,
+        memory={**memory.public_state(), "ticket_id": ticket_id},
+    )
+
+
+def _image_retry_response(
+    memory: AssistantSessionMemory,
+    result: EvidenceVerificationResult,
+    *,
+    ticket_id: str | None,
+    label: str = "Upload product image",
+) -> InteractiveChatResponse:
+    memory.evidence_retry_count += 1
+    memory.remember("assistant", result.customer_message)
+    return InteractiveChatResponse(
+        messages=memory.messages,
+        actions=[
+            _return_details_action(
+                label=label,
+                description_required=False,
+                image_required=True,
+                allow_multiple=False,
+            )
+        ],
+        citations=[],
+        decision=None,
+        memory={**memory.public_state(), "ticket_id": ticket_id},
+    )
+
+
+async def _handle_ticket_request(
+    customer: CustomerProfile,
+    memory: AssistantSessionMemory,
+    message: str,
+) -> InteractiveChatResponse:
+    lowered = message.lower()
+    cancel_requested = _is_ticket_cancel_request(message)
+    explicit_ticket_id = _extract_ticket_id(message)
+
+    tickets, list_call = list_customer_tickets(customer.id, active_only=True)
+    _log_tool_call(customer.id, None, list_call)
+    _log_reasoning(
+        "ticket_lookup",
+        "Listed customer return tickets for assistant request.",
+        customer_id=customer.id,
+        metadata={"message": message, "ticket_count": len(tickets), "cancel_requested": cancel_requested},
+    )
+
+    if not cancel_requested:
+        if not tickets:
+            return _assistant_response(
+                memory,
+                f"{_hi(customer)}, you do not have any open return tickets right now.",
+            )
+
+        lines = [_format_ticket_line(ticket) for ticket in tickets]
+        content = (
+            f"{_hi(customer)}, here are your active return tickets:\n\n"
+            + "\n\n".join(lines)
+            + "\n\nSay \"cancel my last ticket\" or mention a ticket ID if you want to close one."
+        )
+        memory.workflow_state = "answered_ticket_query"
+        memory.remember("assistant", content)
+        return InteractiveChatResponse(messages=memory.messages, memory=memory.public_state())
+
+    target: dict | None = None
+    if explicit_ticket_id:
+        target = next((ticket for ticket in tickets if ticket["request_id"] == explicit_ticket_id), None)
+        if not target:
+            looked_up, get_call = get_customer_ticket(customer.id, explicit_ticket_id)
+            _log_tool_call(customer.id, looked_up.get("order_id") if looked_up else None, get_call)
+            target = looked_up
+    elif any(phrase in lowered for phrase in ("last", "latest", "most recent", "recent")):
+        cancellable = [ticket for ticket in tickets if ticket["status"] in CANCELLABLE_TICKET_STATUSES]
+        target = cancellable[0] if cancellable else None
+    elif len(tickets) == 1:
+        target = tickets[0]
+    elif tickets:
+        lines = [_format_ticket_line(ticket) for ticket in tickets]
+        content = (
+            f"{_hi(customer)}, you have more than one open ticket. "
+            "Tell me which one to cancel:\n\n"
+            + "\n\n".join(lines)
+        )
+        memory.remember("assistant", content)
+        return InteractiveChatResponse(messages=memory.messages, memory=memory.public_state())
+
+    if not target:
+        return _assistant_response(
+            memory,
+            f"{_hi(customer)}, I couldn't find an open ticket to cancel. "
+            "Check Active Tickets or ask me to list your tickets.",
+        )
+
+    if target["status"] not in CANCELLABLE_TICKET_STATUSES:
+        return _assistant_response(
+            memory,
+            f"{_hi(customer)}, ticket {target['request_id']} is {target['status']} and can't be cancelled. "
+            "Only pending or in-review tickets can be closed.",
+        )
+
+    cancel_result, cancel_call = cancel_customer_ticket(customer.id, str(target["request_id"]))
+    _log_tool_call(customer.id, str(target["order_id"]), cancel_call)
+    _log_reasoning(
+        "ticket_cancelled",
+        "Customer ticket cancelled through assistant tools.",
+        customer_id=customer.id,
+        order_id=str(target["order_id"]),
+        metadata={"request_id": target["request_id"], "result": cancel_result},
+    )
+
+    if not cancel_result.get("cancelled"):
+        reason = cancel_result.get("reason")
+        if reason == "not_found":
+            detail = "I couldn't find that ticket on your account."
+        else:
+            detail = "That ticket can't be cancelled in its current state."
+        return _assistant_response(memory, f"{_hi(customer)}, {detail}")
+
+    _clear_ticket_session_state(memory, str(target["request_id"]))
+    products = target.get("product_names") or "your order"
+    content = (
+        f"Done, {_first_name(customer)}. I cancelled ticket {target['request_id']} "
+        f"for {products} on order {target['order_id']}. "
+        "It will no longer appear in Active Tickets."
+    )
+    memory.workflow_state = "ticket_cancelled"
+    memory.remember("assistant", content)
+    return InteractiveChatResponse(messages=memory.messages, memory=memory.public_state())
+
+
+def _unable_to_answer(memory: AssistantSessionMemory, customer: CustomerProfile) -> InteractiveChatResponse:
+    return unable_to_answer_response(memory, customer)
 
 
 def _contact_support_response(
@@ -695,12 +1089,13 @@ def _start_return_exchange(
         )
         return _assistant_response(
             memory,
-            f"You already have an active ticket for {', '.join(item.name for item in order.items)} "
+            f"{_hi(customer)}, you already have an active ticket for {', '.join(item.name for item in order.items)} "
             f"on order {order.id}: {active_ticket['request_id']}. You can update it from Active Tickets.",
         )
 
     memory.selected_order_id = order.id
     memory.selected_product_name = ", ".join(item.name for item in order.items)
+    memory.evidence_retry_count = 0
     memory.workflow_state = "awaiting_return_reason"
     _log_reasoning(
         "purchase_resolution",
@@ -710,7 +1105,7 @@ def _start_return_exchange(
         metadata={"product_names": memory.selected_product_name},
     )
     content = (
-        f"I found {memory.selected_product_name} on order {order.id}. "
+        f"{_hi(customer)}, I found {memory.selected_product_name} on order {order.id}. "
         "What is the reason for your return or exchange request?"
     )
     memory.remember("assistant", content)
@@ -747,11 +1142,14 @@ def _prompt_purchase_selection(
         )
         return _assistant_response(
             memory,
-            "I could not find any purchases eligible for a new return. "
+            f"{_hi(customer)}, I could not find any purchases eligible for a new return. "
             "Items that were already returned or have an active ticket can be reviewed from Active Tickets.",
         )
 
-    content = "Which purchase would you like to return? Select one of your recent purchases below."
+    content = (
+        f"{_hi(customer)}, which purchase would you like to return? "
+        "Select one of your recent purchases below."
+    )
     memory.workflow_state = "awaiting_order_selection"
     _log_reasoning(
         "purchase_selection",
@@ -821,6 +1219,7 @@ def _handle_purchase_selection(
     memory.remember("user", f"Selected {product_names} on order {order.id}")
     memory.selected_order_id = order.id
     memory.selected_product_name = product_names
+    memory.evidence_retry_count = 0
     memory.workflow_state = "awaiting_return_reason"
     _log_reasoning(
         "purchase_selection",
@@ -830,7 +1229,10 @@ def _handle_purchase_selection(
         metadata={"product_names": product_names},
     )
 
-    content = f"Got it. What is the reason for returning {product_names} from order {order.id}?"
+    content = (
+        f"Got it, {_first_name(customer)}. What is the reason for returning {product_names} "
+        f"from order {order.id}?"
+    )
     memory.remember("assistant", content)
     return InteractiveChatResponse(
         messages=memory.messages,
@@ -1014,8 +1416,7 @@ async def _handle_reason_selection(
             "product eligibility, item condition, packaging, and proof-of-purchase requirements. "
             "Final sale, digital, subscription, and opened hygiene products may be restricted."
         )
-        memory.remember("assistant", content)
-        return InteractiveChatResponse(messages=memory.messages, memory={**memory.public_state(), "ticket_id": ticket_id})
+        return await _run_existing_refund_flow(customer, memory, content)
 
     if selected_reason == "other":
         memory.workflow_state = "awaiting_other_details"
@@ -1061,7 +1462,7 @@ def _return_details_action(
     )
 
 
-def _handle_return_details(
+async def _handle_return_details(
     customer: CustomerProfile,
     memory: AssistantSessionMemory,
     request: InteractiveChatRequest,
@@ -1106,7 +1507,52 @@ def _handle_return_details(
 
     if description:
         _update_ticket_comment(customer.id, ticket_id, description)
+
+    upload_label = "Upload product image"
+    if memory.workflow_state == "awaiting_packaging_image":
+        upload_label = "Upload packaging image"
+    elif memory.workflow_state == "awaiting_damage_image":
+        upload_label = "Upload damaged product image"
+    elif memory.workflow_state == "awaiting_wrong_item_image":
+        upload_label = "Upload product and box images"
+
     if files:
+        for file_upload in files:
+            if not file_upload.data_base64:
+                continue
+            verification = _verify_uploaded_image(
+                customer,
+                memory,
+                data_base64=file_upload.data_base64,
+            )
+            _log_reasoning(
+                "evidence_verification",
+                "Ran OpenCV/ViT evidence verification on return detail image.",
+                customer_id=customer.id,
+                order_id=memory.selected_order_id,
+                metadata={
+                    "ticket_id": ticket_id,
+                    "passed": verification.passed,
+                    "issue": verification.issue,
+                    "detected_objects": verification.detected_objects,
+                    "retries_remaining": verification.retries_remaining,
+                },
+            )
+            if not verification.passed:
+                if verification.retries_remaining <= 0:
+                    return _escalate_evidence_failure(
+                        customer,
+                        memory,
+                        ticket_id,
+                        verification.customer_message,
+                    )
+                return _image_retry_response(
+                    memory,
+                    verification,
+                    ticket_id=ticket_id,
+                    label=upload_label,
+                )
+        memory.evidence_retry_count = 0
         _replace_ticket_evidence(ticket_id, files)
 
     memory.workflow_state = "ticket_updated"
@@ -1129,9 +1575,11 @@ def _handle_return_details(
     if file_count:
         details.append(f"{file_count} image{'s' if file_count != 1 else ''}")
     detail_text = " and ".join(details) if details else "details"
-    content = f"Thanks, I updated active ticket {ticket_id} with your {detail_text}. You can edit it from Active Tickets."
-    memory.remember("assistant", content)
-    return InteractiveChatResponse(messages=memory.messages, memory={**memory.public_state(), "ticket_id": ticket_id})
+    content = (
+        f"Thanks, {_first_name(customer)}. I updated active ticket {ticket_id} with your {detail_text}. "
+        "I’ll check it against the refund policy now."
+    )
+    return await _run_existing_refund_flow(customer, memory, content)
 
 
 def _order_is_returnable(customer_id: str, order) -> bool:
@@ -1258,12 +1706,24 @@ async def _run_existing_refund_flow(
     decision = await run_refund_agent(
         ChatRequest(customer_id=customer.id, order_id=memory.selected_order_id, message=intro)
     )
-    content = f"{intro}\n\n{decision.customer_message}"
+    request_id = None
+    if memory.selected_order_id:
+        ticket = _active_ticket_for_order(customer.id, memory.selected_order_id)
+        request_id = str(ticket["request_id"]) if ticket else None
+    if decision.order_id:
+        request_id = await apply_refund_decision(
+            decision=decision,
+            customer_id=customer.id,
+            order_id=decision.order_id,
+            request_id=request_id,
+            actor="agent",
+        )
+    content = intro
     memory.remember("assistant", content)
     return InteractiveChatResponse(
         messages=memory.messages,
-        decision=decision,
-        memory=memory.public_state(),
+        decision=public_refund_decision(decision),
+        memory={**memory.public_state(), "ticket_id": request_id},
     )
 
 
