@@ -23,7 +23,7 @@ export default function ImageUploadPrompt({ action, disabled, onUpload }: Props)
   return (
     <div className="assistant-action-card">
       <strong>{action.label}</strong>
-      <p className="muted">Upload a photo so the internal image check can attach evidence.</p>
+      <p className="muted">Upload a photo so we can review your return request.</p>
       <input type="file" accept={action.accept ?? "image/*"} disabled={disabled} onChange={handleChange} />
       {status ? <small className="muted">{status}</small> : null}
     </div>

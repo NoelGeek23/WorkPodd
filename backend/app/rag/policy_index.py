@@ -55,7 +55,7 @@ def chunk_policy(policy_text: str) -> list[dict]:
                 content = "\n".join(current_lines).strip()
                 chunks.append({"section_title": current_title, "content": content})
             current_title = line.removeprefix("## ").strip()
-            current_lines = [line]
+            current_lines = []
         else:
             current_lines.append(line)
 
@@ -135,3 +135,159 @@ def retrieve_policy_sections(query: str, limit: int = 4) -> list[dict]:
 
     ranked.sort(key=lambda item: item["score"], reverse=True)
     return ranked[:limit]
+
+
+POLICY_QUERY_STOP_WORDS = {
+    "a",
+    "an",
+    "the",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "what",
+    "how",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "do",
+    "does",
+    "did",
+    "can",
+    "could",
+    "would",
+    "should",
+    "will",
+    "my",
+    "your",
+    "our",
+    "their",
+    "i",
+    "we",
+    "you",
+    "me",
+    "about",
+    "for",
+    "of",
+    "in",
+    "on",
+    "at",
+    "to",
+    "from",
+    "shopward",
+    "policy",
+    "policies",
+    "rule",
+    "rules",
+    "say",
+    "says",
+    "tell",
+    "know",
+    "want",
+    "need",
+    "please",
+    "that",
+    "this",
+    "there",
+    "have",
+    "has",
+    "get",
+    "give",
+}
+
+POLICY_QUERY_PREFIXES = (
+    "what is the ",
+    "what is our ",
+    "what is ",
+    "what are the ",
+    "what are ",
+    "tell me about the ",
+    "tell me about ",
+    "explain the ",
+    "explain ",
+    "can you tell me about ",
+    "do we have a ",
+    "do we have ",
+)
+
+
+def extract_policy_focus_terms(query: str) -> list[str]:
+    tokens = TOKEN_RE.findall(query.lower())
+    seen: set[str] = set()
+    focus: list[str] = []
+    for token in tokens:
+        if token in POLICY_QUERY_STOP_WORDS or len(token) <= 2:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        focus.append(token)
+    return focus
+
+
+def format_policy_topic(query: str) -> str:
+    text = query.strip().rstrip("?.!").lower()
+    for prefix in POLICY_QUERY_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix) :].strip()
+            break
+    return text or query.strip().rstrip("?.!")
+
+
+def _policy_corpus_text() -> str:
+    return load_policy().lower()
+
+
+def _section_text(section: dict) -> str:
+    return f"{section.get('section_title', '')}\n{section.get('content', '')}".lower()
+
+
+def validate_policy_answer(query: str, sections: list[dict]) -> dict[str, str | None]:
+    if not sections:
+        return {"verdict": "unsure", "topic": None, "reason": "no_sections"}
+
+    focus_terms = extract_policy_focus_terms(query)
+    if not focus_terms:
+        primary_score = float(sections[0].get("score", 0))
+        if primary_score < 0.12:
+            return {"verdict": "unsure", "topic": None, "reason": "low_score_no_focus_terms"}
+        return {"verdict": "answer", "topic": None, "reason": "generic_policy_query"}
+
+    corpus = _policy_corpus_text()
+    missing_from_policy = [term for term in focus_terms if term not in corpus]
+    if missing_from_policy:
+        return {
+            "verdict": "not_found",
+            "topic": format_policy_topic(query),
+            "reason": f"terms_missing_from_policy:{','.join(missing_from_policy)}",
+        }
+
+    primary = sections[0]
+    primary_score = float(primary.get("score", 0))
+    section_text = _section_text(primary)
+    title = str(primary.get("section_title", "")).lower()
+    matched_terms = [term for term in focus_terms if term in section_text]
+    coverage = len(matched_terms) / len(focus_terms)
+
+    if primary_score < 0.10:
+        return {"verdict": "unsure", "topic": None, "reason": "low_rag_score"}
+
+    if coverage < 0.5:
+        return {"verdict": "unsure", "topic": None, "reason": "low_term_coverage"}
+
+    if coverage < 1.0:
+        uncovered = [term for term in focus_terms if term not in section_text]
+        if uncovered:
+            return {"verdict": "unsure", "topic": None, "reason": f"partial_match:{','.join(uncovered)}"}
+
+    if len(focus_terms) >= 2 and primary_score < 0.16:
+        title_hits = sum(1 for term in focus_terms if term in title)
+        if title_hits == 0:
+            return {"verdict": "unsure", "topic": None, "reason": "weak_title_match"}
+
+    return {"verdict": "answer", "topic": None, "reason": "validated"}

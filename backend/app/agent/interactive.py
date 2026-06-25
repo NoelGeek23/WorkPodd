@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from difflib import SequenceMatcher
+from datetime import date
+from uuid import uuid4
 
 from app.agent.graph import run_refund_agent
 from app.agent.session_memory import AssistantSessionMemory
+from app.db.database import get_connection
 from app.models import (
     AssistantAction,
     AssistantMessage,
@@ -15,7 +19,9 @@ from app.models import (
     InteractiveChatResponse,
     InteractiveUploadRequest,
 )
-from app.rag.policy_index import retrieve_policy_sections
+from app.rag.policy_index import format_policy_topic, retrieve_policy_sections, validate_policy_answer
+from app.services.evidence_store import persist_ticket_evidence
+from app.services.log_bus import log_bus
 
 RETURN_REASONS = [
     AssistantOption(
@@ -67,6 +73,29 @@ POLICY_TERMS = {
     "store credit",
 }
 
+POLICY_SCOPE_TERMS = POLICY_TERMS | {
+    "cancel",
+    "cancellation",
+    "chargeback",
+    "condition",
+    "delivery",
+    "damaged",
+    "defect",
+    "defective",
+    "eligible",
+    "eligibility",
+    "gift card",
+    "lost shipment",
+    "open box",
+    "packaging",
+    "replacement",
+    "returnable",
+    "return",
+    "refund",
+    "shipping",
+    "wrong item",
+}
+
 RETURN_TERMS = {
     "return",
     "refund",
@@ -79,6 +108,60 @@ RETURN_TERMS = {
     "missing",
 }
 
+PURCHASE_TERMS = {
+    "purchase",
+    "purchases",
+    "order",
+    "orders",
+    "item",
+    "items",
+    "product",
+    "products",
+    "bought",
+    "last purchase",
+    "recent purchase",
+    "what can i return",
+}
+
+CONTACT_OPTIONS = [
+    AssistantOption(id="call_now", label="Call Now", description="Talk to a support representative."),
+    AssistantOption(id="email_support", label="Email", description="Send your question to support."),
+]
+
+SUPPORT_SCOPE_TERMS = POLICY_SCOPE_TERMS | PURCHASE_TERMS | RETURN_TERMS | {
+    "account",
+    "address",
+    "customer service",
+    "help",
+    "invoice",
+    "payment",
+    "support",
+    "tracking",
+}
+
+
+def _log_reasoning(
+    stage: str,
+    message: str,
+    *,
+    customer_id: str | None = None,
+    order_id: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(
+        log_bus.publish(
+            stage,
+            message,
+            customer_id=customer_id,
+            order_id=order_id,
+            metadata=metadata,
+        )
+    )
+
 
 async def handle_interactive_chat(
     token: str,
@@ -86,32 +169,87 @@ async def handle_interactive_chat(
     memory: AssistantSessionMemory,
     request: InteractiveChatRequest,
 ) -> InteractiveChatResponse:
+    if request.action_id == "select_purchase" and request.selected_option:
+        _log_reasoning(
+            "purchase_selection",
+            "Customer selected a purchase from the return flow.",
+            customer_id=customer.id,
+            order_id=request.selected_option,
+            metadata={"selected_option": request.selected_option},
+        )
+        return _handle_purchase_selection(customer, memory, request.selected_option)
+
+    if request.action_id == "return_details":
+        _log_reasoning(
+            "ticket_update",
+            "Customer submitted return ticket details.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={
+                "description_present": bool((request.description or "").strip()),
+                "file_count": len(request.files),
+                "workflow_state": memory.workflow_state,
+            },
+        )
+        return _handle_return_details(customer, memory, request)
+
     if request.selected_option:
+        _log_reasoning(
+            "reason_selection",
+            "Customer selected a return reason.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"selected_option": request.selected_option},
+        )
         return await _handle_reason_selection(customer, memory, request.selected_option)
 
     message = (request.message or "").strip()
     if not message:
         return _assistant_response(memory, "Tell me what you need help with.")
 
+    _log_reasoning(
+        "message_received",
+        "Received customer message for interactive assistant.",
+        customer_id=customer.id,
+        metadata={"message": message, "workflow_state": memory.workflow_state},
+    )
     memory.remember("user", message)
     if memory.workflow_state == "awaiting_order":
         memory.current_intent = "return_exchange_request"
+        _log_reasoning(
+            "intent",
+            "Continuing return flow while waiting for order details.",
+            customer_id=customer.id,
+            metadata={"intent": memory.current_intent},
+        )
         return _start_return_exchange(customer, memory, message)
 
     intent = _classify_intent(message)
     memory.current_intent = intent
+    _log_reasoning(
+        "intent",
+        f"Classified customer message as {intent}.",
+        customer_id=customer.id,
+        metadata={"intent": intent, "message": message},
+    )
 
     if intent == "policy_question":
-        return _answer_policy_question(memory, message)
+        return _answer_policy_question(customer, memory, message)
+
+    if intent == "purchase_query":
+        return _answer_purchase_query(customer, memory, message)
 
     if intent == "return_exchange_request":
         return _start_return_exchange(customer, memory, message)
 
-    return _assistant_response(
-        memory,
-        "I can help with Shopward policy questions or guide a return/exchange request. "
-        "For returns, mention your order ID, product name, or SKU.",
-    )
+    if _is_support_scope_query(message):
+        return _contact_support_response(
+            memory,
+            "I cannot answer that from the return policy or your available account tools.",
+            customer_id=customer.id,
+        )
+
+    return _unable_to_answer(memory)
 
 
 def handle_interactive_upload(
@@ -119,11 +257,37 @@ def handle_interactive_upload(
     memory: AssistantSessionMemory,
     upload: InteractiveUploadRequest,
 ) -> InteractiveChatResponse:
+    _log_reasoning(
+        "evidence_upload",
+        "Customer uploaded evidence for assistant review.",
+        customer_id=customer.id,
+        order_id=memory.selected_order_id,
+        metadata={
+            "file_name": upload.file_name,
+            "content_type": upload.content_type,
+            "size": upload.size,
+            "workflow_state": memory.workflow_state,
+        },
+    )
     if not upload.content_type.startswith("image/"):
+        _log_reasoning(
+            "evidence_rejected",
+            "Rejected upload because it was not an image.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"content_type": upload.content_type},
+        )
         return _assistant_response(memory, "Please upload an image file so I can attach it as evidence.")
 
     max_size = 5 * 1024 * 1024
     if upload.size > max_size:
+        _log_reasoning(
+            "evidence_rejected",
+            "Rejected upload because it exceeded the size limit.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"size": upload.size, "max_size": max_size},
+        )
         return _assistant_response(memory, "That image is too large for the demo. Please upload one under 5 MB.")
 
     memory.uploaded_evidence = {
@@ -136,11 +300,27 @@ def handle_interactive_upload(
             "requires_manual_review": True,
         },
     }
+    if upload.data_base64 and memory.selected_order_id:
+        ticket = _active_ticket_for_order(customer.id, memory.selected_order_id)
+        if ticket:
+            with get_connection() as connection:
+                persist_ticket_evidence(
+                    connection,
+                    str(ticket["request_id"]),
+                    [upload],
+                )
     memory.workflow_state = "manual_review_escalated"
+    _log_reasoning(
+        "escalation",
+        "Image evidence attached and case routed for manual review.",
+        customer_id=customer.id,
+        order_id=memory.selected_order_id,
+        metadata=memory.uploaded_evidence,
+    )
 
     content = (
-        "Thanks, I attached the image evidence. The internal image check marked this as requiring "
-        "manual review, so I’m escalating this case to an admin specialist."
+        "Thanks, I attached the image evidence. This case needs a support specialist to review the "
+        "damage details, so I’m escalating it for follow-up."
     )
     memory.remember("assistant", content)
     return InteractiveChatResponse(
@@ -162,34 +342,181 @@ def _classify_intent(message: str) -> str:
         phrase in lowered for phrase in action_phrases
     ):
         return "policy_question"
+    if _is_purchase_query(lowered):
+        return "purchase_query"
     if any(term in lowered for term in RETURN_TERMS):
         return "return_exchange_request"
     return "unknown"
 
 
-def _answer_policy_question(memory: AssistantSessionMemory, message: str) -> InteractiveChatResponse:
-    sections = retrieve_policy_sections(message, limit=3)
-    if not sections:
+def _is_purchase_query(lowered: str) -> bool:
+    if any(term in lowered for term in POLICY_TERMS):
+        return False
+    question_starts = ("what ", "which ", "show ", "list ", "get ", "tell me", "can i", "what can")
+    return any(term in lowered for term in PURCHASE_TERMS) and (
+        lowered.startswith(question_starts)
+        or "my last" in lowered
+        or "my recent" in lowered
+        or "can i return" in lowered
+        or "what items can i return" in lowered
+    )
+
+
+def _answer_purchase_query(
+    customer: CustomerProfile,
+    memory: AssistantSessionMemory,
+    message: str,
+) -> InteractiveChatResponse:
+    lowered = message.lower()
+    orders = sorted(customer.orders, key=lambda order: order.order_date, reverse=True)
+
+    ranked_index = _ranked_purchase_index(lowered)
+    if ranked_index is not None:
+        selected_orders = orders[ranked_index : ranked_index + 1]
+        intro = f"Your {_ranked_purchase_label(ranked_index)} is:"
+    elif "last" in lowered or "latest" in lowered or "most recent" in lowered:
+        selected_orders = orders[:1]
+        intro = "Your most recent purchase is:"
+    elif "return" in lowered or "eligible" in lowered:
+        selected_orders = [order for order in orders if _has_potentially_returnable_item(order)]
+        intro = "Based on product type and basic exclusions, these purchases may be worth checking for return eligibility:"
+    else:
+        selected_orders = orders[:5]
+        intro = "Here are your recent purchases:"
+
+    _log_reasoning(
+        "purchase_lookup",
+        "Resolved purchase query against customer order history.",
+        customer_id=customer.id,
+        metadata={
+            "message": message,
+            "selected_order_ids": [order.id for order in selected_orders],
+            "result_count": len(selected_orders),
+        },
+    )
+
+    if not selected_orders:
         content = (
-            "I could not find a matching policy section.\n\n"
-            "Try asking about return windows, final sale items, VIP rules, exchanges, or damaged items."
+            "I could not find a matching purchase list for that request.\n\n"
+            "Try asking for your last purchase, recent purchases, or which items may be returnable."
         )
         memory.remember("assistant", content)
         return InteractiveChatResponse(messages=memory.messages, memory=memory.public_state())
 
+    lines = []
+    for order in selected_orders:
+        product_names = ", ".join(item.name for item in order.items)
+        return_hint = _return_hint(order)
+        lines.append(
+            f"{order.id}: {product_names}. Purchased on {order.order_date}. "
+            f"Status: {order.status}. Total: ${order.total:.2f}. {return_hint}"
+        )
+
+    content = (
+        f"{intro}\n\n"
+        + "\n\n".join(lines)
+        + "\n\nIf you want to start a return or exchange, say something like: "
+        "\"I want to return ord_5001\" or \"I want to return Yoga Mat\"."
+    )
+    memory.workflow_state = "answered_purchase_query"
+    memory.remember("assistant", content)
+    return InteractiveChatResponse(messages=memory.messages, memory=memory.public_state())
+
+
+def _has_potentially_returnable_item(order) -> bool:
+    if order.status != "delivered":
+        return False
+    return any(
+        not item.final_sale
+        and not item.digital_download
+        and not item.subscription_product
+        and not (item.hygiene_sensitive and item.condition != "unopened")
+        for item in order.items
+    )
+
+
+def _return_hint(order) -> str:
+    if order.status != "delivered":
+        return "This is not delivered yet, so standard return checks may not apply."
+    if not _has_potentially_returnable_item(order):
+        return "This has product-level restrictions, so it may be denied or require review."
+    return "This is not automatically approved, but it can be checked against the policy."
+
+
+def _answer_policy_question(
+    customer: CustomerProfile,
+    memory: AssistantSessionMemory,
+    message: str,
+) -> InteractiveChatResponse:
+    if not _is_policy_scope_query(message):
+        if _is_support_scope_query(message):
+            return _contact_support_response(
+                memory,
+                "I could not find that topic in the Shopward return and refund policy.",
+                customer_id=customer.id,
+            )
+        return _unable_to_answer(memory)
+
+    retrieved_sections = retrieve_policy_sections(message, limit=8)
+    sections = _rank_policy_sections(message, retrieved_sections)[:3]
+    validation = validate_policy_answer(message, sections)
+    _log_reasoning(
+        "policy_rag",
+        "Retrieved and ranked policy sections for interactive answer.",
+        customer_id=customer.id,
+        metadata={
+            "message": message,
+            "validation": validation,
+            "top_sections": [
+                {
+                    "chunk_id": section.get("chunk_id"),
+                    "section_title": section.get("section_title"),
+                    "score": section.get("score"),
+                }
+                for section in sections
+            ],
+            "retrieved_count": len(retrieved_sections),
+        },
+    )
+
+    if validation["verdict"] == "not_found":
+        topic = validation.get("topic") or format_policy_topic(message)
+        _log_reasoning(
+            "policy_validation",
+            "Policy answer rejected because the requested topic is not in the policy document.",
+            customer_id=customer.id,
+            metadata={"message": message, "validation": validation, "topic": topic},
+        )
+        return _assistant_response(
+            memory,
+            f"We do not have a {topic} in the Shopward return and refund policy.",
+        )
+
+    if validation["verdict"] == "unsure":
+        _log_reasoning(
+            "policy_validation",
+            "Policy answer rejected because retrieval confidence was too low.",
+            customer_id=customer.id,
+            metadata={"message": message, "validation": validation},
+        )
+        return _assistant_response(memory, "I am unable to answer that at this moment.")
+
+    if not sections:
+        return _assistant_response(memory, "I am unable to answer that at this moment.")
+
     primary = sections[0]
-    supporting = sections[1:]
     content_parts = [
         "Here is what the Shopward policy says.",
-        f"Primary section: {primary['section_title']}. {primary['content'][:360].replace(chr(10), ' ')}",
+        _format_policy_section_for_chat(primary["section_title"], primary["content"]),
     ]
 
-    if supporting:
-        supporting_text = " ".join(
-            f"{section['section_title']}: {section['content'][:180].replace(chr(10), ' ')}"
-            for section in supporting
+    for section in sections[1:]:
+        if not _should_include_supporting_section(message, section, primary):
+            continue
+        content_parts.append(
+            _format_policy_section_for_chat(section["section_title"], section["content"], max_chars=320)
         )
-        content_parts.append(f"Related sections: {supporting_text}")
+        break
 
     lowered = message.lower()
     if "vip" in lowered or "return window" in lowered:
@@ -209,6 +536,132 @@ def _answer_policy_question(memory: AssistantSessionMemory, message: str) -> Int
     )
 
 
+def _format_policy_section_for_chat(title: str, content: str, max_chars: int | None = None) -> str:
+    body = _normalize_policy_body(content)
+    if max_chars is not None:
+        body = _truncate_at_sentence(body, max_chars)
+    return f"{title}\n{body}"
+
+
+def _normalize_policy_body(content: str) -> str:
+    lines: list[str] = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _truncate_at_sentence(text: str, max_chars: int) -> str:
+    compact = re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
+    if len(compact) <= max_chars:
+        return text.strip()
+
+    truncated = compact[:max_chars]
+    for separator in (". ", "; ", ", "):
+        boundary = truncated.rfind(separator)
+        if boundary >= int(max_chars * 0.55):
+            return truncated[: boundary + 1].strip()
+
+    boundary = truncated.rfind(" ")
+    if boundary > 0:
+        return truncated[:boundary].strip() + "..."
+
+    return truncated.strip() + "..."
+
+
+def _should_include_supporting_section(message: str, section: dict, primary: dict) -> bool:
+    title = str(section.get("section_title", "")).lower()
+    primary_title = str(primary.get("section_title", "")).lower()
+    if title == primary_title:
+        return False
+
+    lowered = message.lower()
+    skip_titles = {"overview", "purpose", "definitions"}
+    if title in skip_titles and not any(term in lowered for term in skip_titles):
+        return False
+
+    if any(term in title for term in ("return window", "vip", "refund", "return", "eligible", "exchange")):
+        if any(term in lowered for term in ("return window", "vip", "refund", "return", "eligible", "exchange")):
+            return True
+
+    return float(section.get("score", 0)) >= 0.14
+
+
+def _is_policy_scope_query(message: str) -> bool:
+    lowered = message.lower()
+    scoped_terms = POLICY_SCOPE_TERMS - {"policy", "rule"}
+    return any(term in lowered for term in scoped_terms)
+
+
+def _rank_policy_sections(message: str, sections: list[dict]) -> list[dict]:
+    lowered = message.lower()
+
+    def boosted_score(section: dict) -> float:
+        title = str(section.get("section_title", "")).lower()
+        content = str(section.get("content", "")).lower()
+        score = float(section.get("score", 0))
+
+        if "return window" in lowered and "return window" in title:
+            score += 1.5
+        if "vip" in lowered and "vip" in title:
+            score += 1.2
+        if "final sale" in lowered and "final sale" in content:
+            score += 1.0
+        if "digital" in lowered and "digital" in content:
+            score += 1.0
+        if "damaged" in lowered and "damaged" in title:
+            score += 1.0
+        if "wrong item" in lowered and "wrong item" in title:
+            score += 1.0
+        if "shipping" in lowered and "shipping" in title:
+            score += 1.0
+        if "exchange" in lowered and "exchange" in title:
+            score += 1.0
+        return score
+
+    return sorted(sections, key=boosted_score, reverse=True)
+
+
+def _is_support_scope_query(message: str) -> bool:
+    lowered = message.lower()
+    return any(term in lowered for term in SUPPORT_SCOPE_TERMS)
+
+
+def _unable_to_answer(memory: AssistantSessionMemory) -> InteractiveChatResponse:
+    return _assistant_response(memory, "I am unable to answer that.")
+
+
+def _contact_support_response(
+    memory: AssistantSessionMemory,
+    content: str,
+    *,
+    customer_id: str | None = None,
+) -> InteractiveChatResponse:
+    memory.workflow_state = "support_contact_offered"
+    _log_reasoning(
+        "handoff",
+        "Assistant offered contact support options.",
+        customer_id=customer_id,
+        order_id=memory.selected_order_id,
+        metadata={"workflow_state": memory.workflow_state, "selected_reason": memory.selected_reason},
+    )
+    memory.remember("assistant", content)
+    return InteractiveChatResponse(
+        messages=memory.messages,
+        actions=[
+            AssistantAction(
+                id="contact_support",
+                type="contact_support",
+                label="Call Now or Email",
+                options=CONTACT_OPTIONS,
+            )
+        ],
+        memory=memory.public_state(),
+    )
+
+
 def _start_return_exchange(
     customer: CustomerProfile,
     memory: AssistantSessionMemory,
@@ -216,18 +669,168 @@ def _start_return_exchange(
 ) -> InteractiveChatResponse:
     order = _resolve_order(customer, message)
     if not order:
-        content = "Which purchase is this for? Please mention an order ID, product name, or SKU from your purchases."
-        memory.workflow_state = "awaiting_order"
-        memory.remember("assistant", content)
-        return InteractiveChatResponse(messages=memory.messages, memory=memory.public_state())
+        _log_reasoning(
+            "purchase_resolution",
+            "Could not resolve order from return request; prompting purchase selection.",
+            customer_id=customer.id,
+            metadata={"message": message},
+        )
+        return _prompt_purchase_selection(customer, memory)
+    if not _order_is_returnable(customer.id, order):
+        _log_reasoning(
+            "return_blocked",
+            "Blocked return request because order was already returned.",
+            customer_id=customer.id,
+            order_id=order.id,
+        )
+        return _assistant_response(memory, _returned_order_message(order))
+    active_ticket = _active_ticket_for_order(customer.id, order.id)
+    if active_ticket:
+        _log_reasoning(
+            "ticket_lookup",
+            "Found an existing active ticket for the selected order.",
+            customer_id=customer.id,
+            order_id=order.id,
+            metadata=active_ticket,
+        )
+        return _assistant_response(
+            memory,
+            f"You already have an active ticket for {', '.join(item.name for item in order.items)} "
+            f"on order {order.id}: {active_ticket['request_id']}. You can update it from Active Tickets.",
+        )
 
     memory.selected_order_id = order.id
     memory.selected_product_name = ", ".join(item.name for item in order.items)
     memory.workflow_state = "awaiting_return_reason"
+    _log_reasoning(
+        "purchase_resolution",
+        "Resolved return request to a customer order.",
+        customer_id=customer.id,
+        order_id=order.id,
+        metadata={"product_names": memory.selected_product_name},
+    )
     content = (
         f"I found {memory.selected_product_name} on order {order.id}. "
         "What is the reason for your return or exchange request?"
     )
+    memory.remember("assistant", content)
+    return InteractiveChatResponse(
+        messages=memory.messages,
+        actions=[
+            AssistantAction(
+                id="return_reason",
+                type="show_reason_options",
+                label="Select a reason",
+                options=RETURN_REASONS,
+            )
+        ],
+        memory=memory.public_state(),
+    )
+
+
+def _prompt_purchase_selection(
+    customer: CustomerProfile,
+    memory: AssistantSessionMemory,
+) -> InteractiveChatResponse:
+    active_order_ids = _active_ticket_order_ids(customer.id)
+    recent_orders = [
+        order
+        for order in sorted(customer.orders, key=lambda order: order.order_date, reverse=True)
+        if order.id not in active_order_ids and _order_is_returnable(customer.id, order)
+    ][:5]
+    if not recent_orders:
+        _log_reasoning(
+            "purchase_selection",
+            "No recent purchases without active tickets were available for selection.",
+            customer_id=customer.id,
+            metadata={"active_order_ids": sorted(active_order_ids)},
+        )
+        return _assistant_response(
+            memory,
+            "I could not find any purchases eligible for a new return. "
+            "Items that were already returned or have an active ticket can be reviewed from Active Tickets.",
+        )
+
+    content = "Which purchase would you like to return? Select one of your recent purchases below."
+    memory.workflow_state = "awaiting_order_selection"
+    _log_reasoning(
+        "purchase_selection",
+        "Prompted customer to select a recent purchase.",
+        customer_id=customer.id,
+        metadata={"order_ids": [order.id for order in recent_orders]},
+    )
+    memory.remember("assistant", content)
+    return InteractiveChatResponse(
+        messages=memory.messages,
+        actions=[
+            AssistantAction(
+                id="select_purchase",
+                type="select_purchase",
+                label="Select a purchase",
+                options=[_purchase_option(order) for order in recent_orders],
+            )
+        ],
+        memory=memory.public_state(),
+    )
+
+
+def _purchase_option(order) -> AssistantOption:
+    product_names = ", ".join(item.name for item in order.items)
+    description = f"Order {order.id} • Purchased {order.order_date} • ${order.total:.2f}"
+    return AssistantOption(id=order.id, label=product_names, description=description)
+
+
+def _handle_purchase_selection(
+    customer: CustomerProfile,
+    memory: AssistantSessionMemory,
+    selected_order_id: str,
+) -> InteractiveChatResponse:
+    order = next((order for order in customer.orders if order.id == selected_order_id), None)
+    if not order:
+        _log_reasoning(
+            "purchase_selection",
+            "Rejected purchase selection because order was not in customer profile.",
+            customer_id=customer.id,
+            order_id=selected_order_id,
+        )
+        return _assistant_response(memory, "Please select one of the purchases shown above.")
+    if not _order_is_returnable(customer.id, order):
+        _log_reasoning(
+            "return_blocked",
+            "Rejected purchase selection because order was already returned.",
+            customer_id=customer.id,
+            order_id=order.id,
+        )
+        return _assistant_response(memory, _returned_order_message(order))
+    active_ticket = _active_ticket_for_order(customer.id, order.id)
+    if active_ticket:
+        _log_reasoning(
+            "ticket_lookup",
+            "Rejected purchase selection because order already has an active ticket.",
+            customer_id=customer.id,
+            order_id=order.id,
+            metadata=active_ticket,
+        )
+        return _assistant_response(
+            memory,
+            f"Order {order.id} already has active ticket {active_ticket['request_id']}. "
+            "You can update it from Active Tickets.",
+        )
+
+    product_names = ", ".join(item.name for item in order.items)
+    memory.remember("user", f"Selected {product_names} on order {order.id}")
+    memory.selected_order_id = order.id
+    memory.selected_product_name = product_names
+    memory.workflow_state = "awaiting_return_reason"
+    _log_reasoning(
+        "purchase_selection",
+        "Accepted purchase selection and requested return reason.",
+        customer_id=customer.id,
+        order_id=order.id,
+        metadata={"product_names": product_names},
+    )
+
+    content = f"Got it. What is the reason for returning {product_names} from order {order.id}?"
     memory.remember("assistant", content)
     return InteractiveChatResponse(
         messages=memory.messages,
@@ -259,59 +862,384 @@ async def _handle_reason_selection(
     if not memory.selected_order_id:
         return _assistant_response(memory, "Please mention the product or order ID before selecting a reason.")
 
+    order = next((item for item in customer.orders if item.id == memory.selected_order_id), None)
+    if order and not _order_is_returnable(customer.id, order):
+        return _assistant_response(memory, _returned_order_message(order))
+
+    ticket_id = _ensure_active_ticket(
+        customer_id=customer.id,
+        order_id=memory.selected_order_id,
+        reason=label,
+        status="Manual Review" if selected_reason == "missing_parts" else "Pending",
+    )
+    _log_reasoning(
+        "ticket_created",
+        "Ensured active return ticket after reason selection.",
+        customer_id=customer.id,
+        order_id=memory.selected_order_id,
+        metadata={
+            "ticket_id": ticket_id,
+            "reason": label,
+            "selected_reason": selected_reason,
+            "status": "Manual Review" if selected_reason == "missing_parts" else "Pending",
+        },
+    )
+
+    if selected_reason == "defective_item":
+        memory.workflow_state = "awaiting_defect_description"
+        _log_reasoning(
+            "workflow_state",
+            "Defective item workflow requires a customer description.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"ticket_id": ticket_id, "workflow_state": memory.workflow_state},
+        )
+        content = "Please describe the defect so our support team can review the issue."
+        memory.remember("assistant", content)
+        return InteractiveChatResponse(
+            messages=memory.messages,
+            actions=[
+                _return_details_action(
+                    label="Describe the defect",
+                    description_required=True,
+                    image_required=False,
+                    allow_multiple=False,
+                )
+            ],
+            memory={**memory.public_state(), "ticket_id": ticket_id},
+        )
+
+    if selected_reason == "packaging_damaged_product_ok":
+        memory.workflow_state = "awaiting_packaging_image"
+        _log_reasoning(
+            "workflow_state",
+            "Packaging damage workflow requires packaging image evidence.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"ticket_id": ticket_id, "workflow_state": memory.workflow_state},
+        )
+        content = "Please upload an image showing the damaged packaging with the product inside."
+        memory.remember("assistant", content)
+        return InteractiveChatResponse(
+            messages=memory.messages,
+            actions=[
+                _return_details_action(
+                    label="Upload packaging image",
+                    description_required=False,
+                    image_required=True,
+                    allow_multiple=False,
+                )
+            ],
+            memory={**memory.public_state(), "ticket_id": ticket_id},
+        )
+
     if selected_reason == "packaging_and_product_damaged":
         memory.workflow_state = "awaiting_damage_image"
+        _log_reasoning(
+            "workflow_state",
+            "Damage workflow requires product or packaging image evidence.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"ticket_id": ticket_id, "workflow_state": memory.workflow_state},
+        )
         content = (
             "Because both the packaging and product are damaged, please upload a photo. "
-            "The internal image check will attach evidence and escalate this to admin review."
+            "We’ll attach it to your request and route the case for specialist review."
         )
         memory.remember("assistant", content)
         return InteractiveChatResponse(
             messages=memory.messages,
             actions=[
-                AssistantAction(
-                    id="damage_image",
-                    type="upload_image",
+                _return_details_action(
                     label="Upload damaged product image",
-                    accept="image/*",
+                    description_required=False,
+                    image_required=True,
+                    allow_multiple=False,
                 )
             ],
-            memory=memory.public_state(),
+            memory={**memory.public_state(), "ticket_id": ticket_id},
         )
 
     if selected_reason == "wrong_item_sent":
         memory.workflow_state = "awaiting_wrong_item_image"
-        content = "For a wrong-item claim, please upload a photo of the received item and label."
+        _log_reasoning(
+            "workflow_state",
+            "Wrong item workflow requires product and box images.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"ticket_id": ticket_id, "workflow_state": memory.workflow_state},
+        )
+        content = "For a wrong-item claim, please upload images of both the received product and the box."
         memory.remember("assistant", content)
         return InteractiveChatResponse(
             messages=memory.messages,
             actions=[
-                AssistantAction(
-                    id="wrong_item_image",
-                    type="upload_image",
-                    label="Upload wrong item evidence",
-                    accept="image/*",
+                _return_details_action(
+                    label="Upload product and box images",
+                    description_required=False,
+                    image_required=True,
+                    allow_multiple=True,
                 )
             ],
-            memory=memory.public_state(),
+            memory={**memory.public_state(), "ticket_id": ticket_id},
         )
 
-    if selected_reason == "packaging_damaged_product_ok":
+    if selected_reason == "missing_parts":
+        memory.workflow_state = "human_escalated"
+        _log_reasoning(
+            "escalation",
+            "Missing parts request escalated to manual review.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"ticket_id": ticket_id, "workflow_state": memory.workflow_state},
+        )
+        return _contact_support_response(
+            memory,
+            "I created an active ticket and escalated this to a support specialist because parts are missing.",
+            customer_id=customer.id,
+        )
+
+    if selected_reason == "changed_mind":
+        memory.workflow_state = "ticket_created_policy_referenced"
+        _log_reasoning(
+            "policy_reference",
+            "Changed-mind request created with policy reference for review.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"ticket_id": ticket_id, "workflow_state": memory.workflow_state},
+        )
         content = (
-            "Packaging-only damage usually does not qualify for a full automatic refund if the product is fine. "
-            "I can still check standard return eligibility for this order."
+            "I created an active ticket for this request.\n\n"
+            "Shopward policy: changed-mind returns are checked against the standard return window, "
+            "product eligibility, item condition, packaging, and proof-of-purchase requirements. "
+            "Final sale, digital, subscription, and opened hygiene products may be restricted."
         )
-    elif selected_reason == "defective_item":
-        content = "I’ll check this against the manufacturer defect and return eligibility rules."
-    elif selected_reason == "missing_parts":
-        content = "Missing parts may require review, but I’ll first run the standard eligibility checks."
-    elif selected_reason == "changed_mind":
-        content = "I’ll check the standard return window and product eligibility rules."
-    else:
-        content = "I’ll run the standard return eligibility checks for this order."
+        memory.remember("assistant", content)
+        return InteractiveChatResponse(messages=memory.messages, memory={**memory.public_state(), "ticket_id": ticket_id})
 
-    decision_response = await _run_existing_refund_flow(customer, memory, content)
-    return decision_response
+    if selected_reason == "other":
+        memory.workflow_state = "awaiting_other_details"
+        _log_reasoning(
+            "workflow_state",
+            "Other return workflow requires a customer description.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"ticket_id": ticket_id, "workflow_state": memory.workflow_state},
+        )
+        content = "Please describe the reason for the return. You can also upload an image if it helps."
+        memory.remember("assistant", content)
+        return InteractiveChatResponse(
+            messages=memory.messages,
+            actions=[
+                _return_details_action(
+                    label="Add details",
+                    description_required=True,
+                    image_required=False,
+                    allow_multiple=True,
+                )
+            ],
+            memory={**memory.public_state(), "ticket_id": ticket_id},
+        )
+
+    return _assistant_response(memory, "I created an active ticket for this return request.")
+
+
+def _return_details_action(
+    label: str,
+    description_required: bool,
+    image_required: bool,
+    allow_multiple: bool,
+) -> AssistantAction:
+    return AssistantAction(
+        id="return_details",
+        type="collect_return_details",
+        label=label,
+        accept="image/*",
+        description_required=description_required,
+        image_required=image_required,
+        allow_multiple=allow_multiple,
+    )
+
+
+def _handle_return_details(
+    customer: CustomerProfile,
+    memory: AssistantSessionMemory,
+    request: InteractiveChatRequest,
+) -> InteractiveChatResponse:
+    if not memory.selected_order_id or not memory.selected_reason:
+        return _assistant_response(memory, "Please start a return request before adding details.")
+
+    reason_label = next(
+        (option.label for option in RETURN_REASONS if option.id == memory.selected_reason),
+        memory.selected_reason,
+    )
+    ticket_id = _ensure_active_ticket(customer.id, memory.selected_order_id, reason_label)
+
+    description = (request.description or "").strip()
+    files = request.files
+
+    description_required = memory.workflow_state in {"awaiting_defect_description", "awaiting_other_details"}
+    image_required = memory.workflow_state in {
+        "awaiting_packaging_image",
+        "awaiting_damage_image",
+        "awaiting_wrong_item_image",
+    }
+
+    if description_required and not description:
+        _log_reasoning(
+            "ticket_update_rejected",
+            "Ticket update rejected because description was required.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"ticket_id": ticket_id, "workflow_state": memory.workflow_state},
+        )
+        return _assistant_response(memory, "Please add a description before submitting this ticket update.")
+    if image_required and not files:
+        _log_reasoning(
+            "ticket_update_rejected",
+            "Ticket update rejected because image evidence was required.",
+            customer_id=customer.id,
+            order_id=memory.selected_order_id,
+            metadata={"ticket_id": ticket_id, "workflow_state": memory.workflow_state},
+        )
+        return _assistant_response(memory, "Please upload the requested image before submitting this ticket update.")
+
+    if description:
+        _update_ticket_comment(customer.id, ticket_id, description)
+    if files:
+        _replace_ticket_evidence(ticket_id, files)
+
+    memory.workflow_state = "ticket_updated"
+    _log_reasoning(
+        "ticket_updated",
+        "Active ticket details were updated.",
+        customer_id=customer.id,
+        order_id=memory.selected_order_id,
+        metadata={
+            "ticket_id": ticket_id,
+            "description_present": bool(description),
+            "file_count": len(files),
+            "workflow_state": memory.workflow_state,
+        },
+    )
+    file_count = len(files)
+    details = []
+    if description:
+        details.append("description")
+    if file_count:
+        details.append(f"{file_count} image{'s' if file_count != 1 else ''}")
+    detail_text = " and ".join(details) if details else "details"
+    content = f"Thanks, I updated active ticket {ticket_id} with your {detail_text}. You can edit it from Active Tickets."
+    memory.remember("assistant", content)
+    return InteractiveChatResponse(messages=memory.messages, memory={**memory.public_state(), "ticket_id": ticket_id})
+
+
+def _order_is_returnable(customer_id: str, order) -> bool:
+    if order.status == "returned":
+        return False
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM ReturnRequest
+            WHERE customer_id = ?
+              AND order_id = ?
+              AND status = 'Approved'
+            LIMIT 1
+            """,
+            (customer_id, order.id),
+        ).fetchone()
+    return row is None
+
+
+def _returned_order_message(order) -> str:
+    product_names = ", ".join(item.name for item in order.items)
+    return (
+        f"{product_names} on order {order.id} has already been returned and "
+        "cannot be submitted for another return request."
+    )
+
+
+def _active_ticket_order_ids(customer_id: str) -> set[str]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT order_id
+            FROM ReturnRequest
+            WHERE customer_id = ?
+              AND status NOT IN ('Closed', 'Denied', 'Approved')
+            """,
+            (customer_id,),
+        ).fetchall()
+    return {row["order_id"] for row in rows}
+
+
+def _active_ticket_for_order(customer_id: str, order_id: str) -> dict | None:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT request_id, status
+            FROM ReturnRequest
+            WHERE customer_id = ?
+              AND order_id = ?
+              AND status NOT IN ('Closed', 'Denied', 'Approved')
+            ORDER BY request_date DESC, request_id DESC
+            LIMIT 1
+            """,
+            (customer_id, order_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _ensure_active_ticket(
+    customer_id: str,
+    order_id: str,
+    reason: str,
+    status: str = "Pending",
+) -> str:
+    existing = _active_ticket_for_order(customer_id, order_id)
+    if existing:
+        return str(existing["request_id"])
+
+    request_id = f"ret_{uuid4().hex[:8]}"
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO ReturnRequest (
+                request_id, customer_id, order_id, request_date, reason,
+                customer_comment, requested_resolution, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                customer_id,
+                order_id,
+                date.today().isoformat(),
+                reason,
+                "",
+                "refund",
+                status,
+            ),
+        )
+    return request_id
+
+
+def _update_ticket_comment(customer_id: str, request_id: str, comment: str) -> None:
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE ReturnRequest
+            SET customer_comment = ?
+            WHERE request_id = ?
+              AND customer_id = ?
+            """,
+            (comment, request_id, customer_id),
+        )
+
+
+def _replace_ticket_evidence(request_id: str, files: list) -> None:
+    with get_connection() as connection:
+        persist_ticket_evidence(connection, request_id, files)
 
 
 async def _run_existing_refund_flow(
@@ -320,6 +1248,13 @@ async def _run_existing_refund_flow(
     intro: str,
 ) -> InteractiveChatResponse:
     memory.workflow_state = "decision_completed"
+    _log_reasoning(
+        "policy_evaluation",
+        "Interactive assistant handed off to deterministic refund policy agent.",
+        customer_id=customer.id,
+        order_id=memory.selected_order_id,
+        metadata={"message": intro},
+    )
     decision = await run_refund_agent(
         ChatRequest(customer_id=customer.id, order_id=memory.selected_order_id, message=intro)
     )
@@ -339,6 +1274,12 @@ def _assistant_response(memory: AssistantSessionMemory, content: str) -> Interac
 
 def _resolve_order(customer: CustomerProfile, message: str):
     normalized_message = message.lower()
+    ranked_index = _ranked_purchase_index(normalized_message)
+    if ranked_index is not None:
+        orders = sorted(customer.orders, key=lambda order: order.order_date, reverse=True)
+        if ranked_index < len(orders):
+            return orders[ranked_index]
+
     normalized_compact = re.sub(r"[^a-z0-9]+", " ", normalized_message).strip()
     candidates: dict[str, float] = {}
 
@@ -371,6 +1312,29 @@ def _resolve_order(customer: CustomerProfile, message: str):
     if best_score >= 0.72 and best_score - second_score >= 0.06:
         return next(order for order in customer.orders if order.id == best_order_id)
     return None
+
+
+def _ranked_purchase_index(lowered: str) -> int | None:
+    if any(phrase in lowered for phrase in ("second last", "second-last", "2nd last", "second most recent", "2nd most recent")):
+        return 1
+    if any(phrase in lowered for phrase in ("third last", "third-last", "3rd last", "third most recent", "3rd most recent")):
+        return 2
+    if any(phrase in lowered for phrase in ("fourth last", "fourth-last", "4th last", "fourth most recent", "4th most recent")):
+        return 3
+    if any(phrase in lowered for phrase in ("fifth last", "fifth-last", "5th last", "fifth most recent", "5th most recent")):
+        return 4
+    if any(phrase in lowered for phrase in ("last purchase", "latest purchase", "most recent purchase", "last order", "latest order", "most recent order")):
+        return 0
+    if re.search(r"\blast (product|item) i purchased\b", lowered):
+        return 0
+    return None
+
+
+def _ranked_purchase_label(index: int) -> str:
+    if index == 0:
+        return "most recent purchase"
+    labels = {1: "second most recent purchase", 2: "third most recent purchase", 3: "fourth most recent purchase"}
+    return labels.get(index, f"{index + 1}th most recent purchase")
 
 
 def _message_windows(message: str, token_count: int) -> list[str]:

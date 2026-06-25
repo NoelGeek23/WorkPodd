@@ -25,9 +25,37 @@ def get_connection() -> sqlite3.Connection:
     return connection
 
 
+def _migrate_schema(connection: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(ReturnRequest)").fetchall()
+    }
+    if "admin_message" not in columns:
+        connection.execute("ALTER TABLE ReturnRequest ADD COLUMN admin_message TEXT")
+
+    evidence_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(Evidence)").fetchall()
+    }
+    if "content_type" not in evidence_columns:
+        connection.execute("ALTER TABLE Evidence ADD COLUMN content_type TEXT")
+
+    connection.execute(
+        """
+        UPDATE Orders
+        SET status = 'returned'
+        WHERE order_id IN (
+            SELECT order_id FROM ReturnRequest WHERE status = 'Approved'
+        )
+          AND status != 'returned'
+        """
+    )
+
+
 def initialize_schema() -> None:
     with get_connection() as connection:
         connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        _migrate_schema(connection)
 
 
 def table_count(table_name: str) -> int:

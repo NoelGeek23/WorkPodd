@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS ReturnRequest (
         'Manager Review',
         'Closed'
     )),
+    admin_message TEXT,
     FOREIGN KEY(customer_id)
         REFERENCES Customer(customer_id),
     FOREIGN KEY(order_id)
@@ -92,6 +93,7 @@ CREATE TABLE IF NOT EXISTS Evidence (
         'damage_report'
     )),
     file_path TEXT,
+    content_type TEXT,
     verified BOOLEAN,
     uploaded_date DATE,
     FOREIGN KEY(request_id)

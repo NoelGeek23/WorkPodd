@@ -1,8 +1,9 @@
 import { FormEvent, useState } from "react";
-import { Customer, login } from "../lib/api";
+import BrandLogo from "./BrandLogo";
+import { CurrentUser, login } from "../lib/api";
 
 type Props = {
-  onLogin: (token: string, customer: Customer) => void;
+  onLogin: (token: string, customer: CurrentUser) => void;
 };
 
 export default function LoginPage({ onLogin }: Props) {
@@ -28,11 +29,27 @@ export default function LoginPage({ onLogin }: Props) {
 
   return (
     <main className="login-shell">
+      <section className="login-brand-panel">
+        <BrandLogo />
+        <h1>Welcome back</h1>
+        <p className="login-brand-copy">
+          Manage returns, review active tickets, and get instant policy guidance from your
+          Shopward customer portal.
+        </p>
+        <ul className="login-feature-list">
+          <li>Track return requests in real time</li>
+          <li>Upload evidence and update tickets anytime</li>
+          <li>Chat with the AI support assistant</li>
+        </ul>
+      </section>
+
       <section className="panel login-card">
-        <p className="eyebrow">Shopward Customer Portal</p>
-        <h1>Sign in to your refunds dashboard</h1>
+        <p className="eyebrow">Sign in</p>
+        <h2>Access your account</h2>
         <p className="muted">
-          Use any seeded customer email with the demo password <code>12345678</code>.
+          Demo account: <code>avery.stone@mailinator.com</code> · password <code>12345678</code>
+          <br />
+          Admin dashboard: <code>admin@mailinator.com</code> · password <code>12345678</code>
         </p>
 
         <form onSubmit={submit} className="login-form">
@@ -56,8 +73,8 @@ export default function LoginPage({ onLogin }: Props) {
               required
             />
           </label>
-          <button type="submit" disabled={loading}>
-            {loading ? "Signing in..." : "Sign in"}
+          <button type="submit" className="primary-button" disabled={loading}>
+            {loading ? "Signing in..." : "Sign in to portal"}
           </button>
         </form>
 

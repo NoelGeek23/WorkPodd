@@ -25,6 +25,7 @@ export type Order = {
 
 export type Customer = {
   id: string;
+  role: "customer";
   name: string;
   email: string;
   loyalty_tier: string;
@@ -36,9 +37,26 @@ export type Customer = {
   orders: Order[];
 };
 
+export type AdminProfile = {
+  id: string;
+  role: "admin";
+  name: string;
+  email: string;
+  loyalty_tier: string;
+  fraud_flag: boolean;
+  chargeback_count: number;
+  refund_count_last_12_months: number;
+  lifetime_value: number;
+  notes: string;
+  orders: [];
+};
+
+export type CurrentUser = Customer | AdminProfile;
+
 export type LoginResponse = {
   token: string;
-  customer: Customer;
+  role: CurrentUser["role"];
+  customer: CurrentUser;
 };
 
 export type RefundDecision = {
@@ -84,6 +102,42 @@ export type PolicySection = {
   content: string;
 };
 
+export type EvidenceUpload = {
+  file_name: string;
+  content_type: string;
+  size: number;
+  data_base64?: string;
+};
+
+export type TicketEvidence = {
+  evidence_id: string;
+  type: string;
+  file_path: string;
+  content_type?: string | null;
+  verified: boolean;
+  uploaded_date: string;
+};
+
+export type ActiveTicket = {
+  request_id: string;
+  order_id: string;
+  request_date: string;
+  reason: string;
+  customer_comment: string;
+  requested_resolution: string;
+  status: string;
+  admin_message: string | null;
+  total_amount: number;
+  product_names: string;
+  evidence: TicketEvidence[];
+};
+
+export type AdminTicket = ActiveTicket & {
+  customer_id: string;
+  customer_name: string;
+  customer_email: string;
+};
+
 export type AssistantOption = {
   id: string;
   label: string;
@@ -92,10 +146,18 @@ export type AssistantOption = {
 
 export type AssistantAction = {
   id: string;
-  type: "show_reason_options" | "upload_image";
+  type:
+    | "show_reason_options"
+    | "upload_image"
+    | "select_purchase"
+    | "contact_support"
+    | "collect_return_details";
   label: string;
   options: AssistantOption[];
   accept?: string | null;
+  description_required: boolean;
+  image_required: boolean;
+  allow_multiple: boolean;
 };
 
 export type AssistantMessage = {
@@ -135,8 +197,68 @@ export function login(email: string, password: string): Promise<LoginResponse> {
   });
 }
 
-export function getMe(token: string): Promise<Customer> {
-  return request<Customer>("/api/me", undefined, token);
+export function getMe(token: string): Promise<CurrentUser> {
+  return request<CurrentUser>("/api/me", undefined, token);
+}
+
+export function getActiveTickets(token: string): Promise<ActiveTicket[]> {
+  return request<{ tickets: ActiveTicket[] }>("/api/me/tickets", undefined, token).then(
+    (response) => response.tickets,
+  );
+}
+
+export function updateActiveTicket(
+  token: string,
+  requestId: string,
+  payload: { description?: string; files?: EvidenceUpload[] },
+): Promise<{ status: string }> {
+  return request<{ status: string }>(`/api/me/tickets/${requestId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  }, token);
+}
+
+export function cancelActiveTicket(token: string, requestId: string): Promise<{ status: string }> {
+  return request<{ status: string }>(`/api/me/tickets/${requestId}/cancel`, {
+    method: "POST",
+  }, token);
+}
+
+export function getAdminTickets(token: string): Promise<AdminTicket[]> {
+  return request<{ tickets: AdminTicket[] }>("/api/admin/tickets", undefined, token).then(
+    (response) => response.tickets,
+  );
+}
+
+export function approveAdminTicket(token: string, requestId: string): Promise<{ status: string }> {
+  return request<{ status: string }>(`/api/admin/tickets/${requestId}/approve`, {
+    method: "POST",
+  }, token);
+}
+
+export function rejectAdminTicket(
+  token: string,
+  requestId: string,
+  reason: string,
+): Promise<{ status: string }> {
+  return request<{ status: string }>(`/api/admin/tickets/${requestId}/reject`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  }, token);
+}
+
+export function getAssistantSession(token: string): Promise<Pick<InteractiveChatResponse, "messages" | "actions" | "decision">> {
+  return request<Pick<InteractiveChatResponse, "messages" | "actions" | "decision">>(
+    "/api/me/assistant/session",
+    undefined,
+    token,
+  );
+}
+
+export function restartAssistantChat(token: string): Promise<{ status: string }> {
+  return request<{ status: string }>("/api/me/assistant/restart", {
+    method: "POST",
+  }, token);
 }
 
 export function logout(token: string): Promise<{ status: string }> {
@@ -160,7 +282,13 @@ export function sendChat(
 
 export function sendAssistantChat(
   token: string,
-  payload: { message?: string; selected_option?: string; action_id?: string },
+  payload: {
+    message?: string;
+    selected_option?: string;
+    action_id?: string;
+    description?: string;
+    files?: EvidenceUpload[];
+  },
 ): Promise<InteractiveChatResponse> {
   return request<InteractiveChatResponse>("/api/me/assistant/chat", {
     method: "POST",
@@ -168,13 +296,14 @@ export function sendAssistantChat(
   }, token);
 }
 
-export function uploadAssistantImage(token: string, file: File): Promise<InteractiveChatResponse> {
+export function uploadAssistantImage(token: string, file: File, dataBase64: string): Promise<InteractiveChatResponse> {
   return request<InteractiveChatResponse>("/api/me/assistant/upload", {
     method: "POST",
     body: JSON.stringify({
       file_name: file.name,
       content_type: file.type,
       size: file.size,
+      data_base64: dataBase64,
     }),
   }, token);
 }

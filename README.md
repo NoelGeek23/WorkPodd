@@ -92,7 +92,15 @@ Example account:
 avery.stone@mailinator.com
 ```
 
+Admin dashboard account:
+
+```text
+admin@mailinator.com
+```
+
 After login, the customer portal only requests and renders that customer's profile, purchased products, KPIs, and scoped AI chat context. The backend validates every scoped chat request against the logged-in customer's token, so an order belonging to another customer is rejected. Policy document retrieval remains global and shared for all customers.
+
+After login with `admin@mailinator.com`, the frontend routes to the admin dashboard instead of the customer portal. Admin sessions can subscribe to the global real-time agent reasoning stream, while customer sessions only receive log events scoped to their own customer ID. Admins can also review open return requests on the **Active Tickets** tab and approve or reject refunds; customers see the decision on their Active Tickets page.
 
 ## OpenAI Configuration
 

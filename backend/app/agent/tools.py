@@ -312,6 +312,15 @@ def check_return_window(customer: CustomerProfile, order: Order) -> ToolCallLog:
         }
         return _call("check_return_window", {"order_id": order.id}, output)
 
+    if order.status == "returned":
+        output = {
+            "eligible": False,
+            "escalate": False,
+            "rule": "This order has already been returned.",
+            "days_since_delivery": None,
+        }
+        return _call("check_return_window", {"order_id": order.id}, output)
+
     if order.status != "delivered" or not order.delivered_date:
         output = {
             "eligible": False,

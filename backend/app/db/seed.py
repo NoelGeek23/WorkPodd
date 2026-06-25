@@ -179,6 +179,16 @@ FRAUD_ASSESSMENTS = [
 ]
 
 
+def _migrate_legacy_email_domains(connection) -> None:
+    connection.execute(
+        """
+        UPDATE Customer
+        SET email = REPLACE(email, '@example.com', '@mailinator.com')
+        WHERE lower(email) LIKE '%@example.com'
+        """
+    )
+
+
 def seed_demo_data(reset: bool = False) -> None:
     initialize_schema()
     with get_connection() as connection:
@@ -299,6 +309,8 @@ def seed_demo_data(reset: bool = False) -> None:
                 for row in FRAUD_ASSESSMENTS
             ],
         )
+
+        _migrate_legacy_email_domains(connection)
 
 
 def main() -> None:

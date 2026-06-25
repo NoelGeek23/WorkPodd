@@ -3,12 +3,13 @@ from __future__ import annotations
 import os
 import re
 from difflib import SequenceMatcher
+from datetime import date
 from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from app.agent.graph import build_langgraph_definition, run_refund_agent
 from app.agent.interactive import handle_interactive_chat, handle_interactive_upload
@@ -17,6 +18,7 @@ from app.agent.tools import find_customer, load_policy
 from app.db.database import get_connection, has_seed_data, initialize_schema, rows_to_dicts
 from app.db.seed import seed_demo_data
 from app.models import (
+    AdminTicketRejectRequest,
     ChatRequest,
     ChatResponse,
     CustomerProfile,
@@ -26,8 +28,10 @@ from app.models import (
     LoginRequest,
     LoginResponse,
     ScopedChatRequest,
+    TicketUpdateRequest,
 )
 from app.rag.policy_index import ensure_policy_index, retrieve_policy_sections
+from app.services.evidence_store import get_evidence_file, persist_ticket_evidence
 from app.services.log_bus import log_bus
 from app.services.realtime import create_realtime_session
 
@@ -51,12 +55,14 @@ ensure_policy_index()
 
 _compiled_langgraph = build_langgraph_definition()
 DEMO_PASSWORD = "12345678"
-SESSIONS: dict[str, str] = {}
+ADMIN_EMAIL = "admin@mailinator.com"
+SESSIONS: dict[str, dict[str, str]] = {}
 
 
 def _customer_response(customer: CustomerProfile) -> dict:
     return {
         "id": customer.id,
+        "role": "customer",
         "name": customer.name,
         "email": customer.email,
         "loyalty_tier": customer.loyalty_tier.value,
@@ -76,6 +82,22 @@ def _customer_response(customer: CustomerProfile) -> dict:
             }
             for order in customer.orders
         ],
+    }
+
+
+def _admin_response() -> dict:
+    return {
+        "id": "admin",
+        "role": "admin",
+        "name": "Shopward Admin",
+        "email": ADMIN_EMAIL,
+        "loyalty_tier": "admin",
+        "fraud_flag": False,
+        "chargeback_count": 0,
+        "refund_count_last_12_months": 0,
+        "lifetime_value": 0,
+        "notes": "Real-time support operations dashboard.",
+        "orders": [],
     }
 
 
@@ -148,15 +170,26 @@ def _extract_session_token(authorization: str | None, token: str | None) -> str:
     raise HTTPException(status_code=401, detail="Login required")
 
 
+def get_current_session_record(
+    authorization: str | None = Header(default=None),
+    token: str | None = Query(default=None),
+) -> tuple[str, dict[str, str]]:
+    session_token = _extract_session_token(authorization, token)
+    session_record = SESSIONS.get(session_token)
+    if not session_record:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    return session_token, session_record
+
+
 def get_current_customer(
     authorization: str | None = Header(default=None),
     token: str | None = Query(default=None),
 ) -> CustomerProfile:
-    session_token = _extract_session_token(authorization, token)
-    customer_id = SESSIONS.get(session_token)
-    if not customer_id:
-        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    _session_token, session_record = get_current_session_record(authorization, token)
+    if session_record.get("role") != "customer":
+        raise HTTPException(status_code=403, detail="Customer session required")
 
+    customer_id = session_record["id"]
     customer = find_customer(customer_id)
     if not customer:
         raise HTTPException(status_code=401, detail="Session customer no longer exists")
@@ -167,15 +200,39 @@ def get_current_session(
     authorization: str | None = Header(default=None),
     token: str | None = Query(default=None),
 ) -> tuple[str, CustomerProfile]:
-    session_token = _extract_session_token(authorization, token)
-    customer_id = SESSIONS.get(session_token)
-    if not customer_id:
-        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    session_token, session_record = get_current_session_record(authorization, token)
+    if session_record.get("role") != "customer":
+        raise HTTPException(status_code=403, detail="Customer session required")
 
+    customer_id = session_record["id"]
     customer = find_customer(customer_id)
     if not customer:
         raise HTTPException(status_code=401, detail="Session customer no longer exists")
     return session_token, customer
+
+
+def get_current_admin(
+    authorization: str | None = Header(default=None),
+    token: str | None = Query(default=None),
+) -> dict[str, str]:
+    _session_token, session_record = get_current_session_record(authorization, token)
+    if session_record.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin session required")
+    return session_record
+
+
+def _attach_ticket_evidence(connection, tickets: list[dict]) -> None:
+    for ticket in tickets:
+        evidence_rows = connection.execute(
+            """
+            SELECT evidence_id, type, file_path, content_type, verified, uploaded_date
+            FROM Evidence
+            WHERE request_id = ?
+            ORDER BY uploaded_date DESC, evidence_id
+            """,
+            (ticket["request_id"],),
+        ).fetchall()
+        ticket["evidence"] = rows_to_dicts(evidence_rows)
 
 
 @app.get("/api/health")
@@ -193,26 +250,329 @@ async def login(request: LoginRequest) -> LoginResponse:
     if request.password != DEMO_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
+    email = request.email.strip().lower()
+    if email == ADMIN_EMAIL:
+        token = uuid4().hex
+        SESSIONS[token] = {"role": "admin", "id": "admin"}
+        return LoginResponse(token=token, role="admin", customer=_admin_response())
+
     customer = _find_customer_by_email(request.email)
     if not customer:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     token = uuid4().hex
-    SESSIONS[token] = customer.id
-    return LoginResponse(token=token, customer=_customer_response(customer))
+    SESSIONS[token] = {"role": "customer", "id": customer.id}
+    return LoginResponse(token=token, role="customer", customer=_customer_response(customer))
 
 
 @app.post("/api/auth/logout")
-async def logout(session: tuple[str, CustomerProfile] = Depends(get_current_session)) -> dict:
-    session_token, _customer = session
+async def logout(session: tuple[str, dict[str, str]] = Depends(get_current_session_record)) -> dict:
+    session_token, _session_record = session
     clear_session_memory(session_token)
     SESSIONS.pop(session_token, None)
     return {"status": "ok"}
 
 
 @app.get("/api/me")
-async def me(customer: CustomerProfile = Depends(get_current_customer)) -> dict:
+async def me(session: tuple[str, dict[str, str]] = Depends(get_current_session_record)) -> dict:
+    _session_token, session_record = session
+    if session_record.get("role") == "admin":
+        return _admin_response()
+
+    customer = find_customer(session_record["id"])
+    if not customer:
+        raise HTTPException(status_code=401, detail="Session customer no longer exists")
     return _customer_response(customer)
+
+
+@app.get("/api/me/tickets")
+async def my_tickets(customer: CustomerProfile = Depends(get_current_customer)) -> dict:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                rr.request_id,
+                rr.order_id,
+                rr.request_date,
+                rr.reason,
+                rr.customer_comment,
+                rr.requested_resolution,
+                rr.status,
+                rr.admin_message,
+                o.total_amount,
+                GROUP_CONCAT(p.name, ', ') AS product_names
+            FROM ReturnRequest rr
+            JOIN Orders o ON rr.order_id = o.order_id
+            LEFT JOIN OrderItem oi ON oi.order_id = o.order_id
+            LEFT JOIN Product p ON p.product_id = oi.product_id
+            WHERE rr.customer_id = ?
+              AND rr.status NOT IN ('Closed')
+            GROUP BY rr.request_id
+            ORDER BY rr.request_date DESC, rr.request_id DESC
+            """,
+            (customer.id,),
+        ).fetchall()
+        tickets = rows_to_dicts(rows)
+        _attach_ticket_evidence(connection, tickets)
+    return {"tickets": tickets}
+
+
+@app.put("/api/me/tickets/{request_id}")
+async def update_my_ticket(
+    request_id: str,
+    request: TicketUpdateRequest,
+    customer: CustomerProfile = Depends(get_current_customer),
+) -> dict:
+    with get_connection() as connection:
+        ticket = connection.execute(
+            """
+            SELECT request_id
+            FROM ReturnRequest
+            WHERE request_id = ?
+              AND customer_id = ?
+              AND status IN ('Pending', 'Manual Review', 'Manager Review')
+            """,
+            (request_id, customer.id),
+        ).fetchone()
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Active ticket not found")
+
+        if request.description is not None:
+            connection.execute(
+                """
+                UPDATE ReturnRequest
+                SET customer_comment = ?
+                WHERE request_id = ?
+                  AND customer_id = ?
+                """,
+                (request.description.strip(), request_id, customer.id),
+            )
+
+        if request.files:
+            persist_ticket_evidence(connection, request_id, request.files)
+    return {"status": "ok"}
+
+
+@app.get("/api/evidence/{evidence_id}")
+async def get_evidence_file_endpoint(
+    evidence_id: str,
+    session: tuple[str, dict[str, str]] = Depends(get_current_session_record),
+) -> FileResponse:
+    _session_token, session_record = session
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT e.evidence_id, e.content_type, rr.customer_id
+            FROM Evidence e
+            JOIN ReturnRequest rr ON e.request_id = rr.request_id
+            WHERE e.evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    if session_record.get("role") != "admin" and row["customer_id"] != session_record["id"]:
+        raise HTTPException(status_code=403, detail="Cannot access another customer's evidence")
+
+    stored = get_evidence_file(evidence_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="Evidence file not found")
+
+    path, guessed_type = stored
+    media_type = row["content_type"] or guessed_type
+    return FileResponse(path, media_type=media_type, filename=path.name)
+
+
+@app.post("/api/me/tickets/{request_id}/cancel")
+async def cancel_my_ticket(
+    request_id: str,
+    customer: CustomerProfile = Depends(get_current_customer),
+) -> dict:
+    with get_connection() as connection:
+        ticket = connection.execute(
+            """
+            SELECT request_id
+            FROM ReturnRequest
+            WHERE request_id = ?
+              AND customer_id = ?
+              AND status IN ('Pending', 'Manual Review', 'Manager Review')
+            """,
+            (request_id, customer.id),
+        ).fetchone()
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Active ticket not found")
+
+        connection.execute(
+            """
+            UPDATE ReturnRequest
+            SET status = 'Closed'
+            WHERE request_id = ?
+              AND customer_id = ?
+            """,
+            (request_id, customer.id),
+        )
+    return {"status": "ok"}
+
+
+@app.get("/api/admin/tickets")
+async def admin_tickets(_admin: dict[str, str] = Depends(get_current_admin)) -> dict:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                rr.request_id,
+                rr.customer_id,
+                rr.order_id,
+                rr.request_date,
+                rr.reason,
+                rr.customer_comment,
+                rr.requested_resolution,
+                rr.status,
+                rr.admin_message,
+                o.total_amount,
+                c.name AS customer_name,
+                c.email AS customer_email,
+                GROUP_CONCAT(p.name, ', ') AS product_names
+            FROM ReturnRequest rr
+            JOIN Customer c ON rr.customer_id = c.customer_id
+            JOIN Orders o ON rr.order_id = o.order_id
+            LEFT JOIN OrderItem oi ON oi.order_id = o.order_id
+            LEFT JOIN Product p ON p.product_id = oi.product_id
+            WHERE rr.status IN ('Pending', 'Manual Review', 'Manager Review')
+            GROUP BY rr.request_id
+            ORDER BY rr.request_date DESC, rr.request_id DESC
+            """
+        ).fetchall()
+        tickets = rows_to_dicts(rows)
+        _attach_ticket_evidence(connection, tickets)
+    return {"tickets": tickets}
+
+
+@app.post("/api/admin/tickets/{request_id}/approve")
+async def approve_admin_ticket(
+    request_id: str,
+    _admin: dict[str, str] = Depends(get_current_admin),
+) -> dict:
+    with get_connection() as connection:
+        ticket = connection.execute(
+            """
+            SELECT rr.request_id, rr.customer_id, rr.order_id, rr.reason, o.total_amount
+            FROM ReturnRequest rr
+            JOIN Orders o ON rr.order_id = o.order_id
+            WHERE rr.request_id = ?
+              AND rr.status IN ('Pending', 'Manual Review', 'Manager Review')
+            """,
+            (request_id,),
+        ).fetchone()
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Ticket not found or already decided")
+
+        refund_amount = float(ticket["total_amount"])
+        approval_message = (
+            f"Refund of ${refund_amount:.2f} will be transferred to your original bank account "
+            "within 5-7 business days."
+        )
+        connection.execute(
+            """
+            UPDATE ReturnRequest
+            SET status = 'Approved', admin_message = ?
+            WHERE request_id = ?
+            """,
+            (approval_message, request_id),
+        )
+        connection.execute(
+            "UPDATE Orders SET status = 'returned' WHERE order_id = ?",
+            (ticket["order_id"],),
+        )
+        connection.execute(
+            """
+            INSERT INTO RefundHistory (
+                refund_id, customer_id, order_id, refund_amount, refund_reason, approved_date
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"ref_{uuid4().hex[:8]}",
+                ticket["customer_id"],
+                ticket["order_id"],
+                refund_amount,
+                ticket["reason"],
+                date.today().isoformat(),
+            ),
+        )
+
+    await log_bus.publish(
+        "admin_decision",
+        f"Admin approved return request {request_id}.",
+        customer_id=ticket["customer_id"],
+        order_id=ticket["order_id"],
+        metadata={"request_id": request_id, "status": "Approved", "refund_amount": refund_amount},
+    )
+    return {"status": "ok", "request_id": request_id}
+
+
+@app.post("/api/admin/tickets/{request_id}/reject")
+async def reject_admin_ticket(
+    request_id: str,
+    request: AdminTicketRejectRequest,
+    _admin: dict[str, str] = Depends(get_current_admin),
+) -> dict:
+    reason = request.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="Rejection reason is required")
+
+    with get_connection() as connection:
+        ticket = connection.execute(
+            """
+            SELECT request_id, customer_id, order_id
+            FROM ReturnRequest
+            WHERE request_id = ?
+              AND status IN ('Pending', 'Manual Review', 'Manager Review')
+            """,
+            (request_id,),
+        ).fetchone()
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Ticket not found or already decided")
+
+        connection.execute(
+            """
+            UPDATE ReturnRequest
+            SET status = 'Denied', admin_message = ?
+            WHERE request_id = ?
+            """,
+            (reason, request_id),
+        )
+
+    await log_bus.publish(
+        "admin_decision",
+        f"Admin rejected return request {request_id}.",
+        customer_id=ticket["customer_id"],
+        order_id=ticket["order_id"],
+        metadata={"request_id": request_id, "status": "Denied", "reason": reason},
+    )
+    return {"status": "ok", "request_id": request_id}
+
+
+@app.post("/api/me/assistant/restart")
+async def restart_assistant(
+    session: tuple[str, CustomerProfile] = Depends(get_current_session),
+) -> dict:
+    session_token, _customer = session
+    clear_session_memory(session_token)
+    return {"status": "ok"}
+
+
+@app.get("/api/me/assistant/session")
+async def assistant_session(
+    session: tuple[str, CustomerProfile] = Depends(get_current_session),
+) -> dict:
+    session_token, _customer = session
+    memory = get_session_memory(session_token)
+    return {
+        "messages": [{"role": message.role, "content": message.content} for message in memory.messages],
+        "actions": [],
+        "decision": None,
+    }
 
 
 @app.get("/api/customers")
@@ -346,8 +706,10 @@ async def assistant_upload(
 
 
 @app.get("/api/agent/logs")
-async def agent_logs(current_customer: CustomerProfile = Depends(get_current_customer)) -> StreamingResponse:
-    return StreamingResponse(log_bus.stream(current_customer.id), media_type="text/event-stream")
+async def agent_logs(session: tuple[str, dict[str, str]] = Depends(get_current_session_record)) -> StreamingResponse:
+    _session_token, session_record = session
+    customer_id = None if session_record.get("role") == "admin" else session_record["id"]
+    return StreamingResponse(log_bus.stream(customer_id), media_type="text/event-stream")
 
 
 @app.post("/api/voice/session")

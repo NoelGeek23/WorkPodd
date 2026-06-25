@@ -76,6 +76,7 @@ class ScopedChatRequest(BaseModel):
 
 class LoginResponse(BaseModel):
     token: str
+    role: Literal["customer", "admin"]
     customer: dict[str, Any]
 
 
@@ -87,10 +88,26 @@ class AssistantOption(BaseModel):
 
 class AssistantAction(BaseModel):
     id: str
-    type: Literal["show_reason_options", "upload_image"]
+    type: Literal[
+        "show_reason_options",
+        "upload_image",
+        "select_purchase",
+        "contact_support",
+        "collect_return_details",
+    ]
     label: str
     options: list[AssistantOption] = Field(default_factory=list)
     accept: str | None = None
+    description_required: bool = False
+    image_required: bool = False
+    allow_multiple: bool = False
+
+
+class EvidenceUpload(BaseModel):
+    file_name: str
+    content_type: str
+    size: int
+    data_base64: str | None = None
 
 
 class AssistantMessage(BaseModel):
@@ -102,12 +119,24 @@ class InteractiveChatRequest(BaseModel):
     message: str | None = None
     selected_option: str | None = None
     action_id: str | None = None
+    description: str | None = None
+    files: list[EvidenceUpload] = Field(default_factory=list)
 
 
 class InteractiveUploadRequest(BaseModel):
     file_name: str
     content_type: str
     size: int
+    data_base64: str | None = None
+
+
+class TicketUpdateRequest(BaseModel):
+    description: str | None = None
+    files: list[EvidenceUpload] = Field(default_factory=list)
+
+
+class AdminTicketRejectRequest(BaseModel):
+    reason: str
 
 
 class InteractiveChatResponse(BaseModel):

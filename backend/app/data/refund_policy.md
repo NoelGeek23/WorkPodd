@@ -306,14 +306,19 @@ When policy conflicts occur, apply the following order:
 
 Higher priority rules override lower priority rules.
 
-## Examples
+## FAQ
 
-Example 1: Customer purchased headphones, delivered 20 days ago, item unopened. Decision: approved. Reason: within return window.
+Can I return headphones 20 days after delivery if the item is unopened?
+Yes. Returns submitted within the standard 30-day window with proof of purchase and resalable condition are approved.
 
-Example 2: Customer purchased digital software and requested refund after 2 days. Decision: denied. Reason: digital products are non-refundable.
+Can I get a refund on digital software after two days?
+No. Digital downloads are non-refundable once access has been granted.
 
-Example 3: VIP customer requests return after 40 days. Decision: approved. Reason: VIP exception allows up to 45 days.
+Can a VIP customer return an item after 40 days?
+Yes. VIP customers may return eligible physical products within 45 calendar days of delivery.
 
-Example 4: Customer has received 5 refunds in past year. Decision: manual review. Reason: exceeds fraud review threshold.
+What happens if I have received five refunds in the past year?
+The request is routed to manual review because it exceeds the refund abuse review threshold.
 
-Example 5: Customer requests refund for final sale item. Decision: denied. Reason: final sale restriction overrides return window eligibility.
+Can I return a final sale item?
+No. Final sale restrictions override standard return window eligibility.
