@@ -314,7 +314,8 @@ def _node_decide_refund(state: AgentState) -> AgentState:
         decision = RefundDecision(
             status="approved",
             customer_message=(
-                f"Your refund is approved for ${order.total:.2f}. You’ll receive confirmation once it is processed."
+                f"Your return request for ${order.total:.2f} passed policy checks and "
+                "has been sent to an admin for final approval."
             ),
             internal_reason="All policy checks passed for an automatic refund.",
             amount=order.total,
@@ -325,7 +326,11 @@ def _node_decide_refund(state: AgentState) -> AgentState:
             tool_calls=tool_calls,
         )
 
-    audit_decision = "Approved" if decision.status == "approved" else "Denied" if decision.status == "denied" else review_level
+    audit_decision = (
+        "Pending Admin Review"
+        if decision.status == "approved"
+        else ("Denied" if decision.status == "denied" else review_level)
+    )
     return {**state, "decision": decision, "audit_decision": audit_decision, "review_level": review_level}
 
 

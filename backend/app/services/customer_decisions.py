@@ -64,6 +64,11 @@ def customer_facing_message(decision: RefundDecision) -> str:
         )
     if decision.status == "denied":
         return customer_denial_summary(decision)
+    if "awaiting admin approval" in decision.internal_reason.lower():
+        return (
+            "Your return request has been submitted and is pending admin review. "
+            "Check Active Tickets for updates once a decision is made."
+        )
     return (
         "Your return request needs additional review. "
         "A support specialist will follow up with you soon."

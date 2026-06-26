@@ -22,6 +22,10 @@ CUSTOMERS = [
     ("cus_1013", "Elena Rossi", "elena.rossi@mailinator.com", "personal", "US", "2023-05-20", "standard", False, 335.80, False, False, 0),
     ("cus_1014", "Dylan Park", "dylan.park@mailinator.com", "personal", "US", "2026-02-01", "standard", False, 140.00, False, False, 0),
     ("cus_1015", "Chloe Nguyen", "chloe.nguyen@mailinator.com", "business", "US", "2018-12-12", "platinum", True, 15220.00, False, False, 0),
+    # Loom demo accounts — no pre-seeded return tickets; use these for live recordings.
+    ("cus_1016", "Maya Rivers", "maya.rivers@mailinator.com", "personal", "US", "2019-06-22", "platinum", True, 6840.00, False, False, 0),
+    ("cus_1017", "Liam Carter", "liam.carter@mailinator.com", "personal", "US", "2023-08-19", "standard", False, 189.50, False, False, 0),
+    ("cus_1018", "Zara Wells", "zara.wells@mailinator.com", "personal", "US", "2025-11-02", "standard", False, 312.00, True, True, 0),
 ]
 
 PRODUCTS = [
@@ -68,14 +72,27 @@ PRIMARY_ORDERS = [
     ("ord_5013", "cus_1013", "2026-06-12", "2026-06-14", "2026-06-17", "2026-06-18", "delivered", "delivered", 58.00, "USD", "US", "prod_013", "opened", True, True),
     ("ord_5014", "cus_1014", "2026-05-26", "2026-05-28", "2026-05-31", "2026-06-01", "delivered", "delivered", 140.00, "USD", "US", "prod_014", "used", True, True),
     ("ord_5015", "cus_1015", "2026-05-01", "2026-05-04", "2026-05-09", "2026-05-10", "delivered", "delivered", 199.00, "USD", "US", "prod_015", "unopened", True, True),
+    # Demo: VIP standard refund — multiple eligible orders; 45-day VIP window applies.
+    ("ord_5020", "cus_1016", "2026-06-08", "2026-06-10", "2026-06-12", "2026-06-13", "delivered", "delivered", 76.00, "USD", "US", "prod_006", "unopened", True, True),
+    ("ord_5023", "cus_1016", "2026-05-14", "2026-05-16", "2026-05-18", "2026-05-19", "delivered", "delivered", 89.50, "USD", "US", "prod_002", "unopened", True, True),
+    ("ord_5024", "cus_1016", "2026-06-01", "2026-06-03", "2026-06-05", "2026-06-06", "delivered", "delivered", 184.00, "USD", "US", "prod_011", "unopened", True, True),
+    ("ord_5025", "cus_1016", "2026-04-01", "2026-04-03", "2026-04-08", "2026-04-09", "delivered", "delivered", 199.00, "USD", "US", "prod_015", "unopened", True, True),
+    # Demo: policy hold — final-sale wallet; prescreen and policy checks deny.
+    ("ord_5021", "cus_1017", "2026-06-10", "2026-06-12", "2026-06-15", "2026-06-16", "delivered", "delivered", 59.99, "USD", "US", "prod_025", "unopened", True, True),
+    # Demo: fraud escalation — flagged account; anti-fraud engine escalates to admin review.
+    ("ord_5022", "cus_1018", "2026-06-09", "2026-06-11", "2026-06-14", "2026-06-15", "delivered", "delivered", 240.00, "USD", "US", "prod_003", "unopened", True, True),
 ]
+
+
+DEMO_CUSTOMER_IDS = frozenset({"cus_1016", "cus_1017", "cus_1018"})
 
 
 def _extra_orders() -> list[tuple]:
     orders = []
     product_ids = [product[0] for product in PRODUCTS]
+    customer_pool = [row[0] for row in CUSTOMERS if row[0] not in DEMO_CUSTOMER_IDS]
     for index in range(25):
-        customer = CUSTOMERS[index % len(CUSTOMERS)][0]
+        customer = customer_pool[index % len(customer_pool)]
         product = product_ids[(index + 5) % len(product_ids)]
         order_number = 6001 + index
         purchase_date = DEMO_TODAY - timedelta(days=45 + index)
@@ -176,6 +193,9 @@ FRAUD_ASSESSMENTS = [
     ("fraud_1013", "cus_1013", True, 0.13, False, False, False, "2026-06-01"),
     ("fraud_1014", "cus_1014", True, 0.09, False, False, False, "2026-06-01"),
     ("fraud_1015", "cus_1015", True, 0.03, False, False, False, "2026-06-01"),
+    ("fraud_1016", "cus_1016", True, 0.06, False, False, False, "2026-06-01"),
+    ("fraud_1017", "cus_1017", True, 0.11, False, False, False, "2026-06-01"),
+    ("fraud_1018", "cus_1018", False, 0.79, True, True, True, "2026-06-20"),
 ]
 
 

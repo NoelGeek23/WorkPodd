@@ -201,13 +201,6 @@ body {
   gap: 1rem;
 }
 
-.dashboard-support-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.65fr);
-  gap: 1rem;
-  align-items: start;
-}
-
 .metric-row {
   display: grid;
   gap: 1rem;
@@ -854,6 +847,36 @@ pre {
   background: #e8f8f1;
 }
 
+.product-return-window {
+  border-radius: 999px;
+  padding: 0.2rem 0.65rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  white-space: nowrap;
+  text-align: right;
+  line-height: 1.35;
+}
+
+.product-return-window.positive {
+  color: #1f6b45;
+  background: #e8f8f1;
+}
+
+.product-return-window.warning {
+  color: #9a6700;
+  background: #fff8e6;
+}
+
+.product-return-window.expired {
+  color: #9b1c1c;
+  background: #fdecec;
+}
+
+.product-return-window.muted {
+  color: #5c6670;
+  background: #eef2f5;
+}
+
 .product-card.returned {
   border-color: #b9e6d0;
   background: #f7fcf9;
@@ -971,8 +994,7 @@ pre {
   margin-top: 0.75rem;
 }
 
-.chat-form,
-.voice-actions {
+.chat-form {
   display: flex;
   gap: 0.75rem;
 }
@@ -1739,10 +1761,6 @@ textarea {
 
   .metric-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .dashboard-support-grid {
-    grid-template-columns: 1fr;
   }
 
   .app-shell {

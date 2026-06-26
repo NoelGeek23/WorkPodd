@@ -20,6 +20,7 @@ export type Order = {
   total: number;
   delivered_date: string | null;
   tracking_status: string;
+  shipping_country?: string;
   items: OrderItem[];
 };
 
@@ -86,14 +87,6 @@ export type AgentLogEvent = {
   stage: string;
   message: string;
   metadata: Record<string, unknown>;
-};
-
-export type RealtimeSession = {
-  client_secret: { value?: string } | null;
-  model: string;
-  voice: string;
-  instructions: string;
-  note?: string | null;
 };
 
 export type PolicySection = {
@@ -370,10 +363,6 @@ export function getPolicySections(): Promise<PolicySection[]> {
   return request<{ sections: PolicySection[] }>("/api/policy/sections").then(
     (response) => response.sections,
   );
-}
-
-export function createRealtimeSession(): Promise<RealtimeSession> {
-  return request<RealtimeSession>("/api/voice/session", { method: "POST" });
 }
 
 export function subscribeToAgentLogs(

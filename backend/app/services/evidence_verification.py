@@ -2,56 +2,17 @@ from __future__ import annotations
 
 import base64
 import io
+import json
+import os
 import re
 from dataclasses import dataclass
+
+import httpx
 
 MIN_IMAGE_WIDTH = 320
 MIN_IMAGE_HEIGHT = 240
 MIN_LAPLACIAN_VARIANCE = 35.0
 MAX_RETRIES = 3
-MIN_VIT_CONFIDENCE = 0.08
-VIT_MODEL_ID = "google/vit-base-patch16-224"
-VIT_TOP_K = 5
-
-_vit_model = None
-_vit_processor = None
-
-# ImageNet-oriented keyword hints for ViT top-label sanity checks.
-PRODUCT_CLASSIFICATION_HINTS: dict[str, dict[str, set[str]]] = {
-    "yoga mat": {
-        "expected": {"mat", "yoga", "gym", "exercise", "sleeping", "towel", "blanket", "rug", "carpet"},
-        "forbidden": {"baseball", "bat", "racket", "knife", "scissor", "tennis", "glove", "ballplayer"},
-    },
-    "hoodie": {
-        "expected": {"sweater", "jersey", "coat", "jacket", "shirt", "pullover", "cardigan", "sweatshirt"},
-        "forbidden": {"baseball", "bat", "racket", "laptop", "notebook", "phone", "cellular"},
-    },
-    "headphones": {
-        "expected": {
-            "headphone",
-            "earphone",
-            "headset",
-            "ipod",
-            "microphone",
-            "radio",
-            "speaker",
-            "earpiece",
-        },
-        "forbidden": {"baseball", "bat", "racket", "ball", "skateboard", "surfboard", "ballplayer"},
-    },
-    "lamp": {
-        "expected": {"lamp", "light", "chandelier", "candle", "vase", "table", "desk", "clock"},
-        "forbidden": {"baseball", "bat", "racket", "ball", "ballplayer"},
-    },
-    "mask": {
-        "expected": {"mask", "face", "bandage", "sleep", "pillow", "towel"},
-        "forbidden": {"baseball", "bat", "laptop", "notebook", "phone", "ball"},
-    },
-    "default": {
-        "expected": set(),
-        "forbidden": {"baseball", "bat", "racket", "knife", "scissor", "ballplayer"},
-    },
-}
 
 
 @dataclass
@@ -71,6 +32,12 @@ def _decode_image(data_base64: str) -> bytes:
     return base64.b64decode(payload)
 
 
+def _image_data_url(data_base64: str) -> str:
+    if data_base64.startswith("data:"):
+        return data_base64
+    return f"data:image/jpeg;base64,{data_base64.split(',', 1)[-1]}"
+
+
 def _load_image(image_bytes: bytes):
     import numpy as np
     from PIL import Image
@@ -85,81 +52,77 @@ def _blur_score(gray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def _get_vit_classifier():
-    global _vit_model, _vit_processor
-    if _vit_model is None or _vit_processor is None:
-        from transformers import ViTForImageClassification, ViTImageProcessor
+async def _classify_image_with_openai(
+    data_base64: str,
+    product_name: str,
+) -> tuple[list[str], str | None]:
+    """Classify image contents and check whether they match the expected product."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return [], None
 
-        _vit_processor = ViTImageProcessor.from_pretrained(VIT_MODEL_ID)
-        _vit_model = ViTForImageClassification.from_pretrained(VIT_MODEL_ID)
-        _vit_model.eval()
-    return _vit_processor, _vit_model
+    model = os.getenv("OPENAI_VISION_MODEL", os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"))
+    prompt = (
+        f"You are verifying return evidence photos for an e-commerce support agent.\n"
+        f"The customer claims they are returning: {product_name}\n\n"
+        "Analyze the image and respond with JSON only:\n"
+        "{\n"
+        '  "detected_objects": ["list", "of", "visible", "items"],\n'
+        '  "matches_product": true or false,\n'
+        '  "mismatch_label": "short label for what the image actually shows, or null if it matches"\n'
+        "}\n\n"
+        "Set matches_product to true if the image plausibly shows the claimed product, "
+        "its packaging, or relevant damage.\n"
+        "Set matches_product to false only when the image clearly shows a different unrelated item."
+    )
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 200,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _image_data_url(data_base64), "detail": "low"},
+                    },
+                ],
+            }
+        ],
+    }
 
-
-def _classify_image(image) -> list[tuple[str, float]]:
-    """Classify an image with a Vision Transformer (ImageNet labels)."""
     try:
-        import torch
-    except ImportError:
-        return []
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            content = str(response.json()["choices"][0]["message"]["content"]).strip()
+            parsed = json.loads(content)
+    except (httpx.HTTPError, KeyError, IndexError, ValueError, json.JSONDecodeError):
+        return [], None
 
-    try:
-        processor, model = _get_vit_classifier()
-    except Exception:
-        return []
+    detected_objects = [str(item) for item in parsed.get("detected_objects", []) if item]
+    if parsed.get("matches_product", True):
+        return detected_objects, None
 
-    inputs = processor(images=image, return_tensors="pt")
-    with torch.no_grad():
-        logits = model(**inputs).logits
-    probabilities = torch.nn.functional.softmax(logits, dim=-1)[0]
-    scores, indices = torch.topk(probabilities, min(VIT_TOP_K, probabilities.shape[-1]))
-    id2label = model.config.id2label
-    return [
-        (str(id2label[int(index)]), float(score))
-        for score, index in zip(scores, indices)
-        if float(score) >= MIN_VIT_CONFIDENCE
-    ]
-
-
-def _product_hints(product_name: str) -> dict[str, set[str]]:
-    lowered = product_name.lower()
-    for key, hints in PRODUCT_CLASSIFICATION_HINTS.items():
-        if key != "default" and key in lowered:
-            return hints
-    return PRODUCT_CLASSIFICATION_HINTS["default"]
+    conflict = parsed.get("mismatch_label")
+    if conflict:
+        return detected_objects, str(conflict)
+    if detected_objects:
+        return detected_objects, detected_objects[0]
+    return detected_objects, "unrelated item"
 
 
-def _label_matches_keywords(label: str, keywords: set[str]) -> bool:
-    lowered = label.lower()
-    return any(keyword in lowered for keyword in keywords)
-
-
-def _classification_conflict(product_name: str, predictions: list[tuple[str, float]]) -> str | None:
-    if not predictions:
-        return None
-
-    hints = _product_hints(product_name)
-    for label, score in predictions:
-        if score < MIN_VIT_CONFIDENCE:
-            continue
-        if _label_matches_keywords(label, hints["forbidden"]):
-            return label
-
-    expected = hints.get("expected", set())
-    if not expected:
-        return None
-
-    top_predictions = predictions[:3]
-    if any(_label_matches_keywords(label, expected) for label, _ in top_predictions):
-        return None
-
-    strongest_label, strongest_score = max(top_predictions, key=lambda item: item[1])
-    if strongest_score >= 0.15:
-        return strongest_label
-    return None
-
-
-def verify_evidence_image(
+async def verify_evidence_image(
     *,
     product_name: str,
     data_base64: str,
@@ -168,7 +131,7 @@ def verify_evidence_image(
     retries_remaining = max(0, MAX_RETRIES - attempt_number)
     try:
         image_bytes = _decode_image(data_base64)
-        image, image_array, (width, height) = _load_image(image_bytes)
+        _image, image_array, (width, height) = _load_image(image_bytes)
     except Exception:
         return EvidenceVerificationResult(
             passed=False,
@@ -187,8 +150,7 @@ def verify_evidence_image(
 
     gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
     blur = _blur_score(gray)
-    classified = _classify_image(image)
-    classified_labels = [label for label, _ in classified]
+    classified_labels, conflict = await _classify_image_with_openai(data_base64, product_name)
 
     if width < MIN_IMAGE_WIDTH or height < MIN_IMAGE_HEIGHT:
         return EvidenceVerificationResult(
@@ -229,7 +191,6 @@ def verify_evidence_image(
             retries_remaining=retries_remaining,
         )
 
-    conflict = _classification_conflict(product_name, classified)
     if conflict:
         return EvidenceVerificationResult(
             passed=False,

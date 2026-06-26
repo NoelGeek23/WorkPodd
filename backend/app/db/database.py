@@ -13,7 +13,12 @@ SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 def get_db_path() -> Path:
     configured = os.getenv("SQLITE_DB_PATH")
-    return Path(configured) if configured else DEFAULT_DB_PATH
+    if not configured:
+        return DEFAULT_DB_PATH
+    path = Path(configured)
+    if path.is_absolute():
+        return path
+    return (APP_DIR / path).resolve()
 
 
 def get_connection() -> sqlite3.Connection:

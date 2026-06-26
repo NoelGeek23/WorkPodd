@@ -6,7 +6,6 @@ import LoginPage from "./components/LoginPage";
 import PolicySectionContent from "./components/PolicySectionContent";
 import TicketEvidenceGallery from "./components/TicketEvidenceGallery";
 import TicketSupportFallback from "./components/TicketSupportFallback";
-import VoicePanel from "./components/VoicePanel";
 import {
   ActiveTicket,
   AssistantAction,
@@ -27,6 +26,7 @@ import {
 } from "./lib/api";
 import { fileToEvidenceUpload } from "./lib/evidence";
 import { getPolicySectionTitle, policyPreviewText } from "./lib/policyContent";
+import { getProductReturnLabel, type PurchasedProduct } from "./lib/returnWindow";
 
 const TOKEN_STORAGE_KEY = "shopward_demo_token";
 const navItems = ["Dashboard", "Products", "ActiveTickets", "PolicySections"] as const;
@@ -198,12 +198,14 @@ export default function App() {
     return <AdminDashboard token={token} admin={customer} onLogout={logout} />;
   }
 
-  const purchasedItems = customer.orders.flatMap((order) =>
+  const purchasedItems: PurchasedProduct[] = customer.orders.flatMap((order) =>
     order.items.map((item) => ({
       ...item,
       orderId: order.id,
       orderTotal: order.total,
       orderStatus: order.status,
+      deliveredDate: order.delivered_date,
+      shippingCountry: order.shipping_country ?? "US",
     })),
   );
   const totalOrderValue = customer.orders.reduce((sum, order) => sum + order.total, 0);
@@ -282,6 +284,7 @@ export default function App() {
 
         {activePage === "Products" ? (
           <ProductsPage
+            customer={customer}
             purchasedItems={purchasedItems}
             refundableCount={refundableProducts.length}
             returnedCount={returnedProducts.length}
@@ -355,36 +358,29 @@ function DashboardPage({
         <Metric label="Refunds" value={customer.refund_count_last_12_months.toString()} detail="Last 12 months" />
       </section>
 
-      <div className="dashboard-support-grid">
-        <ChatPanel
-          token={token}
-          customerName={customer.name}
-          messages={chatMessages}
-          actions={chatActions}
-          decision={chatDecision}
-          onStateChange={onChatStateChange}
-          onSessionRestore={onSessionRestore}
-          onDecision={onDecision}
-        />
-        <VoicePanel token={token} onDecision={onDecision} />
-      </div>
+      <ChatPanel
+        token={token}
+        customerName={customer.name}
+        messages={chatMessages}
+        actions={chatActions}
+        decision={chatDecision}
+        onStateChange={onChatStateChange}
+        onSessionRestore={onSessionRestore}
+        onDecision={onDecision}
+      />
     </div>
   );
 }
 
 function ProductsPage({
+  customer,
   purchasedItems,
   refundableCount,
   returnedCount,
   totalOrderValue,
 }: {
-  purchasedItems: Array<
-    Customer["orders"][number]["items"][number] & {
-      orderId: string;
-      orderTotal: number;
-      orderStatus: string;
-    }
-  >;
+  customer: Customer;
+  purchasedItems: PurchasedProduct[];
   refundableCount: number;
   returnedCount: number;
   totalOrderValue: number;
@@ -405,7 +401,9 @@ function ProductsPage({
           </div>
         </div>
         <div className="product-grid">
-          {purchasedItems.map((item) => (
+          {purchasedItems.map((item) => {
+            const returnWindow = getProductReturnLabel(customer, item);
+            return (
             <article
               key={`${item.orderId}-${item.sku}`}
               className={`product-card static${item.orderStatus === "returned" ? " returned" : ""}`}
@@ -414,16 +412,29 @@ function ProductsPage({
                 <strong>{item.name}</strong>
                 {item.orderStatus === "returned" ? (
                   <span className="product-status returned">Returned</span>
-                ) : null}
+                ) : (
+                  <span className={`product-return-window ${returnWindow.tone}`}>
+                    {returnWindow.label}
+                  </span>
+                )}
               </div>
               <span>{item.sku}</span>
               <span>Order: {item.orderId}</span>
               <span>${item.price.toFixed(2)} · {item.condition}</span>
+              {item.deliveredDate && item.orderStatus === "delivered" ? (
+                <small className="muted">
+                  Delivered {item.deliveredDate}
+                  {returnWindow.daysRemaining !== null && returnWindow.daysRemaining >= 0
+                    ? ` · ${returnWindow.allowedDays}-day return window`
+                    : null}
+                </small>
+              ) : null}
               {item.orderStatus === "returned" ? (
                 <small className="muted">This item was returned and is no longer eligible for a new request.</small>
               ) : null}
             </article>
-          ))}
+            );
+          })}
         </div>
       </section>
     </div>

@@ -17,6 +17,7 @@ from app.agent.session_memory import AssistantSessionMemory
 from app.agent.tools import (
     CANCELLABLE_TICKET_STATUSES,
     cancel_customer_ticket,
+    check_return_window,
     get_customer_ticket,
     list_customer_tickets,
 )
@@ -85,7 +86,9 @@ RETURN_REASONS = [
 
 POLICY_TERMS = {
     "policy",
+    "policies",
     "rule",
+    "rules",
     "return window",
     "refund time",
     "processing time",
@@ -98,6 +101,15 @@ POLICY_TERMS = {
     "exchange",
     "store credit",
 }
+
+POLICY_INFORMATION_PHRASES = (
+    "return policy",
+    "return policies",
+    "refund policy",
+    "refund policies",
+    "exchange policy",
+    "exchange policies",
+)
 
 POLICY_SCOPE_TERMS = POLICY_TERMS | {
     "cancel",
@@ -305,6 +317,22 @@ async def handle_interactive_chat(
         metadata={"message": message, "workflow_state": memory.workflow_state},
     )
     memory.remember("user", message)
+
+    if memory.workflow_state in {"awaiting_order", "awaiting_order_selection"}:
+        intent = _classify_intent(message)
+        if intent == "policy_question":
+            memory.workflow_state = "idle"
+            memory.current_intent = intent
+            _log_reasoning(
+                "intent",
+                "Customer asked a policy question while a return flow was open; switching to policy answer.",
+                customer_id=customer.id,
+                metadata={"intent": intent, "message": message},
+            )
+            return _answer_policy_question(customer, memory, message)
+        if intent in {"conversational", "purchase_query", "ticket_request", "unknown"}:
+            memory.workflow_state = "idle"
+
     if memory.workflow_state == "awaiting_order":
         memory.current_intent = "return_exchange_request"
         _log_reasoning(
@@ -325,6 +353,11 @@ async def handle_interactive_chat(
     )
 
     if intent == "policy_question":
+        lowered = message.lower()
+        if _is_return_window_question(lowered):
+            return _answer_return_window_question(customer, memory, message)
+        if _is_vip_membership_question(lowered):
+            return _answer_vip_membership_question(customer, memory, message)
         return _answer_policy_question(customer, memory, message)
 
     if intent == "purchase_query":
@@ -400,10 +433,10 @@ async def handle_interactive_upload(
         ticket_id = str(ticket["request_id"]) if ticket else None
 
     if upload.data_base64:
-        verification = _verify_uploaded_image(customer, memory, data_base64=upload.data_base64)
+        verification = await _verify_uploaded_image(customer, memory, data_base64=upload.data_base64)
         _log_reasoning(
             "evidence_verification",
-            "Ran OpenCV/ViT evidence verification on uploaded image.",
+            "Ran OpenCV/OpenAI Vision evidence verification on uploaded image.",
             customer_id=customer.id,
             order_id=memory.selected_order_id,
             metadata={
@@ -478,19 +511,89 @@ async def handle_interactive_upload(
     )
 
 
+def _is_policy_information_request(lowered: str) -> bool:
+    has_policy_topic = any(term in lowered for term in POLICY_TERMS) or any(
+        phrase in lowered for phrase in POLICY_INFORMATION_PHRASES
+    )
+    if not has_policy_topic:
+        return False
+
+    info_phrases = (
+        "want to know",
+        "need to know",
+        "like to know",
+        "learn about",
+        "tell me about",
+        "can you tell me",
+        "information about",
+        "details about",
+    )
+    if any(phrase in lowered for phrase in info_phrases):
+        return True
+    if lowered.startswith(("what ", "how ", "when ", "which ", "can you explain")):
+        return True
+    if "about" in lowered and any(term in lowered for term in ("policy", "policies", "rule", "rules")):
+        return True
+
+    transactional_phrases = (
+        "i want to return",
+        "i need to return",
+        "i want a refund",
+        "i need a refund",
+        "i want to exchange",
+        "i need to exchange",
+        "return my",
+        "refund my",
+        "exchange my",
+        "replace my",
+    )
+    return not any(phrase in lowered for phrase in transactional_phrases)
+
+
+def _is_return_window_question(lowered: str) -> bool:
+    if not lowered.startswith(("how ", "what ", "when ", "which ", "can you")):
+        return False
+    timing_terms = (
+        "day",
+        "days",
+        "window",
+        "how long",
+        "long do",
+        "deadline",
+        "time limit",
+        "time frame",
+        "timeframe",
+    )
+    return_terms = ("return", "refund", "exchange")
+    return any(term in lowered for term in timing_terms) and any(term in lowered for term in return_terms)
+
+
+def _is_vip_membership_question(lowered: str) -> bool:
+    if "vip" not in lowered:
+        return False
+    membership_phrases = (
+        "become",
+        "be a vip",
+        "get vip",
+        "qualify",
+        "how do i",
+        "how to",
+        "sign up",
+        "join",
+        "membership",
+    )
+    return any(phrase in lowered for phrase in membership_phrases)
+
+
 def _classify_intent(message: str) -> str:
     if _is_ticket_request(message):
         return "ticket_request"
     if is_conversational_message(message):
         return "conversational"
     lowered = message.lower()
-    if "want to know" in lowered or lowered.startswith(("what ", "how ", "when ", "which ")):
-        if any(term in lowered for term in POLICY_TERMS):
-            return "policy_question"
-    action_phrases = ("i want", "i need", "return my", "refund my", "exchange my", "replace my")
-    if any(term in lowered for term in POLICY_TERMS) and not any(
-        phrase in lowered for phrase in action_phrases
-    ):
+    if _is_return_window_question(lowered) or _is_vip_membership_question(lowered):
+        return "policy_question"
+    if _is_policy_information_request(lowered):
         return "policy_question"
     if _is_purchase_query(lowered):
         return "purchase_query"
@@ -596,6 +699,102 @@ def _return_hint(order) -> str:
     if not _has_potentially_returnable_item(order):
         return "This has product-level restrictions, so it may be denied or require review."
     return "This is not automatically approved, but it can be checked against the policy."
+
+
+def _answer_return_window_question(
+    customer: CustomerProfile,
+    memory: AssistantSessionMemory,
+    message: str,
+) -> InteractiveChatResponse:
+    _log_reasoning(
+        "policy_answer",
+        "Answered personalized return-window question from account orders.",
+        customer_id=customer.id,
+        metadata={"message": message},
+    )
+    lines = [
+        f"{_hi(customer)}, here's your return timing based on Shopward policy and your delivered orders.",
+    ]
+    if _is_vip_customer(customer):
+        lines.append(_vip_return_window_note(customer))
+    else:
+        lines.append(
+            "Physical products must be returned within 30 days of delivery for standard US accounts."
+        )
+
+    delivered_orders = sorted(
+        [order for order in customer.orders if order.status == "delivered" and order.delivered_date],
+        key=lambda order: order.delivered_date or "",
+        reverse=True,
+    )
+    if delivered_orders:
+        lines.extend(["", "Your delivered orders:"])
+        for order in delivered_orders[:6]:
+            window = check_return_window(customer, order).output
+            product_names = ", ".join(item.name for item in order.items)
+            days_since = window.get("days_since_delivery")
+            allowed_days = window.get("allowed_days")
+            if window.get("eligible") and days_since is not None and allowed_days is not None:
+                remaining = allowed_days - days_since
+                day_label = "day" if remaining == 1 else "days"
+                lines.append(
+                    f"- {order.id} ({product_names}): {remaining} {day_label} left "
+                    f"(delivered {order.delivered_date})"
+                )
+            elif days_since is not None and allowed_days is not None:
+                expired_by = days_since - allowed_days
+                day_label = "day" if expired_by == 1 else "days"
+                lines.append(
+                    f"- {order.id} ({product_names}): return window expired "
+                    f"{expired_by} {day_label} ago (delivered {order.delivered_date})"
+                )
+            else:
+                lines.append(f"- {order.id} ({product_names}): {window.get('rule', 'See policy.')}")
+
+    if delivered_orders:
+        example_order = delivered_orders[0].id
+        example_product = delivered_orders[0].items[0].name
+        lines.extend(
+            [
+                "",
+                "When you are ready to start a return, say something like "
+                f'"I want to return {example_order}" or "I want to return {example_product}".',
+            ]
+        )
+
+    content = "\n".join(lines)
+    memory.workflow_state = "answered_policy_question"
+    memory.remember("assistant", content)
+    return InteractiveChatResponse(messages=memory.messages, memory=memory.public_state())
+
+
+def _answer_vip_membership_question(
+    customer: CustomerProfile,
+    memory: AssistantSessionMemory,
+    message: str,
+) -> InteractiveChatResponse:
+    _log_reasoning(
+        "policy_answer",
+        "Answered VIP membership question from account context.",
+        customer_id=customer.id,
+        metadata={"message": message},
+    )
+    if _is_vip_customer(customer):
+        content = (
+            f"{_hi(customer)}, you are already a {_tier_label(customer)} VIP member on this account. "
+            f"{_vip_return_window_note(customer)} "
+            "VIP status does not override final sale, gift card, or digital product restrictions."
+        )
+    else:
+        content = (
+            f"{_hi(customer)}, Shopward VIP membership is typically granted to Gold, Platinum, "
+            "or high lifetime-spend accounts. VIP customers receive a 45-day return window on "
+            "eligible physical products instead of the standard 30 days. "
+            "For tier upgrades, contact Shopward Support."
+        )
+    memory.workflow_state = "answered_policy_question"
+    memory.remember("assistant", content)
+    return InteractiveChatResponse(messages=memory.messages, memory=memory.public_state())
 
 
 def _answer_policy_question(
@@ -846,14 +1045,14 @@ def _product_name_for_verification(customer: CustomerProfile, memory: AssistantS
     return "Order items"
 
 
-def _verify_uploaded_image(
+async def _verify_uploaded_image(
     customer: CustomerProfile,
     memory: AssistantSessionMemory,
     *,
     data_base64: str,
 ) -> EvidenceVerificationResult:
     attempt_number = memory.evidence_retry_count + 1
-    return verify_evidence_image(
+    return await verify_evidence_image(
         product_name=_product_name_for_verification(customer, memory),
         data_base64=data_base64,
         attempt_number=attempt_number,
@@ -1562,14 +1761,14 @@ async def _handle_return_details(
         for file_upload in files:
             if not file_upload.data_base64:
                 continue
-            verification = _verify_uploaded_image(
+            verification = await _verify_uploaded_image(
                 customer,
                 memory,
                 data_base64=file_upload.data_base64,
             )
             _log_reasoning(
                 "evidence_verification",
-                "Ran OpenCV/ViT evidence verification on return detail image.",
+                "Ran OpenCV/OpenAI Vision evidence verification on return detail image.",
                 customer_id=customer.id,
                 order_id=memory.selected_order_id,
                 metadata={
@@ -1753,7 +1952,7 @@ async def _run_existing_refund_flow(
         ticket = _active_ticket_for_order(customer.id, memory.selected_order_id)
         request_id = str(ticket["request_id"]) if ticket else None
     if decision.order_id:
-        request_id = await apply_refund_decision(
+        request_id, decision = await apply_refund_decision(
             decision=decision,
             customer_id=customer.id,
             order_id=decision.order_id,

@@ -58,12 +58,12 @@ Customer
 
 The seed dataset includes:
 
-- 15 customers
+- 18 customers (including 3 Loom demo accounts with no pre-opened tickets)
 - 25 products
-- 40 orders
+- 46 orders
 - 15 return requests
 - 20 refund history records
-- 15 fraud assessments
+- 18 fraud assessments
 
 The runtime SQLite database is generated at `backend/app/data/refund_agent.sqlite` by default. Set `SQLITE_DB_PATH` in `backend/.env` to override it.
 
@@ -102,6 +102,24 @@ After login, the customer portal only requests and renders that customer's profi
 
 After login with `admin@mailinator.com`, the frontend routes to the admin dashboard instead of the customer portal. Admin sessions can subscribe to the global real-time agent reasoning stream, while customer sessions only receive log events scoped to their own customer ID. Admins can also review open return requests on the **Active Tickets** tab and approve or reject refunds; customers see the decision on their Active Tickets page.
 
+## Loom Demo Accounts
+
+Use these three seeded customers for a clean live recording. Each has **no pre-existing return ticket**, so you can walk through the full assistant flow from scratch. Password for all accounts: `12345678`.
+
+| Scenario | Email | Order | What to say in chat | Expected outcome |
+| --- | --- | --- | --- | --- |
+| **Standard refund (VIP)** | `maya.rivers@mailinator.com` | `ord_5020` (Yoga Mat, 10 days) or `ord_5023` (Desk Lamp, **35 days** — VIP-only window) | “I want to return my yoga mat from ord_5020” → **I changed my mind** | VIP 45-day window; policy checks pass → ticket **Pending** admin review |
+| **Policy hold (“holding the line”)** | `liam.carter@mailinator.com` | `ord_5021` (Final Sale Wallet) | “I want a refund for ord_5021” | Denied — final sale items are never refundable |
+| **Fraud / escalation + reasoning logs** | `zara.wells@mailinator.com` | `ord_5022` (Headphones, unopened) | “I want to return ord_5022” → pick any reason | Escalated — fraud flag + anti-fraud score; admin sees **Fraud** badge |
+
+### Suggested 7–10 minute Loom outline
+
+1. **Live demo — standard refund (Maya):** Customer portal → chat assistant → select order → reason → show Active Tickets pending state. Switch to admin → approve ticket → show customer outcome.
+2. **Live demo — policy hold (Liam):** Same flow; agent denies with a customer-safe final-sale message. Point out prescreen/policy tools in the reasoning stream.
+3. **Reasoning logs (Zara + admin):** Open admin dashboard reasoning stream (or `GET /api/agent/logs` SSE). Submit Zara’s return and highlight `fraud_scored`, `tool_call`, and `decision` events.
+4. **Voice (optional):** Log in as Maya, use the voice panel, speak a refund request, show transcript hitting the same policy agent.
+5. **Code tour:** `backend/app/agent/graph.py` (LangGraph nodes), `backend/app/agent/tools.py` (deterministic checks), `backend/app/services/fraud_detection.py`, `frontend/src/lib/api.ts` (SSE logs).
+
 ## OpenAI Configuration
 
 The text refund decision works without an API key because policy enforcement is deterministic. Customer facts come from SQLite, and policy context comes from the local RAG index over `backend/app/data/refund_policy.md`.
@@ -115,12 +133,16 @@ The voice component uses an ephemeral Realtime client secret from the backend, c
 
 ## Demo Scenarios
 
+Legacy seeded scenarios (may already have open tickets):
+
 - `cus_1001` / `ord_5001`: opened apparel, gold customer, inside window, should approve.
 - `cus_1002` / `ord_5002`: unopened item outside standard 30 day window, should deny.
 - `cus_1003` / `ord_5003`: fraud flag, should escalate.
 - `cus_1005` / `ord_5005`: final sale item, should deny.
 - `cus_1009` / `ord_5009`: amount above $500, should escalate.
 - `cus_1012` / `ord_5012`: carrier-damaged item, should approve.
+
+Prefer the **Loom Demo Accounts** above for fresh recordings.
 
 ## Key Endpoints
 

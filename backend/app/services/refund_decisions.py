@@ -77,6 +77,22 @@ def _ensure_return_request(
     return request_id
 
 
+def _apply_agent_decision_limits(decision: RefundDecision) -> tuple[RefundDecision, bool]:
+    """Agents may deny or escalate, but only admins can approve refunds."""
+    pending_admin = False
+    if decision.status != "approved":
+        return decision, pending_admin
+
+    pending_admin = True
+    internal_reason = decision.internal_reason or "All policy checks passed."
+    return decision.model_copy(
+        update={
+            "status": "escalated",
+            "internal_reason": f"{internal_reason} Awaiting admin approval.",
+        }
+    ), pending_admin
+
+
 async def apply_refund_decision(
     *,
     decision: RefundDecision,
@@ -84,7 +100,7 @@ async def apply_refund_decision(
     order_id: str,
     request_id: str | None = None,
     actor: str = "agent",
-) -> str:
+) -> tuple[str, RefundDecision]:
     resolved_request_id = request_id or _ensure_return_request(
         customer_id=customer_id,
         order_id=order_id,
@@ -111,11 +127,6 @@ async def apply_refund_decision(
         and decision.status == "approved"
         and actor == "agent"
     ):
-        review_level = (
-            "Manager Review"
-            if fraud_detection.get("risk_level") == "CRITICAL_RISK"
-            else "Manual Review"
-        )
         decision = decision.model_copy(
             update={
                 "status": "escalated",
@@ -144,8 +155,14 @@ async def apply_refund_decision(
                 }
             )
 
+    pending_admin = False
+    if actor == "agent":
+        decision, pending_admin = _apply_agent_decision_limits(decision)
+
     review_level = _review_level_from_decision(decision)
     status = decision_status(decision, review_level)
+    if pending_admin:
+        status = "Pending"
     if decision.status == "denied":
         message = ticket_denial_message(decision, actor=actor)
     else:
@@ -164,7 +181,7 @@ async def apply_refund_decision(
         if not ticket:
             raise ValueError(f"Return request {resolved_request_id} was not found")
 
-        if decision.status == "approved":
+        if decision.status == "approved" and actor == "admin":
             refund_amount = float(decision.amount or ticket["total_amount"])
             message = approval_message(refund_amount)
             connection.execute(
@@ -235,6 +252,7 @@ async def apply_refund_decision(
             "decision_status": decision.status,
             "actor": actor,
             "amount": decision.amount,
+            "pending_admin": pending_admin,
         },
     )
-    return resolved_request_id
+    return resolved_request_id, decision

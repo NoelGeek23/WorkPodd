@@ -178,9 +178,20 @@ class ChatResponse(BaseModel):
     decision: RefundDecision
 
 
+class VoiceConnectRequest(BaseModel):
+    sdp: str
+
+
+class VoiceConnectResponse(BaseModel):
+    sdp: str
+    model: str
+    voice: str
+
+
 class RealtimeSessionResponse(BaseModel):
     client_secret: dict[str, Any] | None = None
     model: str
     voice: str
     instructions: str
+    calls_url: str = "https://api.openai.com/v1/realtime/calls"
     note: str | None = None

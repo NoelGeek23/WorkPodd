@@ -25,6 +25,8 @@ function formatDecisionStatus(status: string): string {
       return "Approved";
     case "denied":
       return "Denied";
+    case "escalated":
+      return "Pending admin review";
     case "manual_review":
     case "manager_review":
       return "Under review";
@@ -46,5 +48,8 @@ function decisionSummary(decision: RefundDecision): string {
       "See Active Tickets for details and support options."
     );
   }
-  return "Your request needs a quick review. We'll follow up with you soon.";
+  return (
+    "Your return request is pending admin review. " +
+    "An admin will approve or deny it — check Active Tickets for updates."
+  );
 }

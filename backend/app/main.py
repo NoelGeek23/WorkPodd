@@ -30,6 +30,8 @@ from app.models import (
     RefundDecision,
     ScopedChatRequest,
     TicketUpdateRequest,
+    VoiceConnectRequest,
+    VoiceConnectResponse,
 )
 from app.rag.fraud_index import ensure_fraud_index
 from app.rag.policy_index import ensure_policy_index
@@ -38,7 +40,7 @@ from app.services.customer_decisions import public_refund_decision
 from app.services.evidence_store import get_evidence_file, persist_ticket_evidence
 from app.services.log_bus import log_bus
 from app.services.refund_decisions import apply_refund_decision, approval_message
-from app.services.realtime import create_realtime_session
+from app.services.realtime import connect_realtime_call, create_realtime_session
 
 load_dotenv()
 
@@ -86,6 +88,7 @@ def _customer_response(customer: CustomerProfile) -> dict:
                 "total": order.total,
                 "delivered_date": order.delivered_date,
                 "tracking_status": order.tracking_status,
+                "shipping_country": order.shipping_country,
                 "items": [item.model_dump() for item in order.items],
             }
             for order in customer.orders
@@ -737,7 +740,7 @@ async def chat(
     if resolved_order_id and all(order.id != resolved_order_id for order in current_customer.orders):
         raise HTTPException(status_code=403, detail="Order does not belong to logged-in customer")
     decision = await run_refund_agent(request.model_copy(update={"order_id": resolved_order_id}))
-    await apply_refund_decision(
+    _, decision = await apply_refund_decision(
         decision=decision,
         customer_id=current_customer.id,
         order_id=resolved_order_id,
@@ -767,7 +770,7 @@ async def scoped_chat(
             message=request.message,
         )
     )
-    await apply_refund_decision(
+    _, decision = await apply_refund_decision(
         decision=decision,
         customer_id=current_customer.id,
         order_id=resolved_order_id,
@@ -809,3 +812,11 @@ async def agent_logs(session: tuple[str, dict[str, str]] = Depends(get_current_s
 async def voice_session() -> dict:
     session = await create_realtime_session()
     return session.model_dump(mode="json")
+
+
+@app.post("/api/voice/connect")
+async def voice_connect(body: VoiceConnectRequest) -> VoiceConnectResponse:
+    result = await connect_realtime_call(body.sdp)
+    if not result.sdp:
+        raise HTTPException(status_code=502, detail=result.error or "Realtime connection failed.")
+    return VoiceConnectResponse(sdp=result.sdp, model=result.model, voice=result.voice)
